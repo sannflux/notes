@@ -1,223 +1,125 @@
 import streamlit as st
 import google.generativeai as genai
-from PIL import Image, ImageEnhance, ImageFilter
-import csv
-import io
-import re
 import json
-import time
-from datetime import datetime
-import pandas as pd
+import io
+from PIL import Image
 
-# ================================================
-# CONFIGURATION & THEME
-# ================================================
-st.set_page_config(page_title="AI Anki Generator PRO", page_icon="🎓", layout="wide")
+# --- CONFIGURATION & SESSION STATE ---
+st.set_page_config(page_title="Gemini Anki Optimizer", page_icon="🎴", layout="wide")
 
-# Initialize Session State for preserving cards across Streamlit reruns
-if 'generated_cards' not in st.session_state:
-    st.session_state['generated_cards'] = []
+if "generated_cards" not in st.session_state:
+    st.session_state.generated_cards = []
 
-# Custom CSS for Anki-like Previews
-st.markdown("""
-    <style>
-    .anki-card {
-        background-color: #2e2e2e;
-        border-radius: 10px;
-        padding: 20px;
-        border: 1px solid #444;
-        margin-bottom: 10px;
-        font-family: Arial;
-    }
-    .anki-front { color: #ffffff; font-size: 1.1em; border-bottom: 1px solid #555; padding-bottom: 10px; }
-    .anki-back { color: #00aaff; font-size: 1.1em; padding-top: 10px; }
-    .tag-pill { background: #444; color: #88eeff; padding: 2px 8px; border-radius: 5px; font-size: 0.8em; }
-    </style>
-""", unsafe_allow_html=True)
+# --- PRESERVATION ANCHOR: MODEL STASIS ---
+# Keeping Gemini 1.5 Flash as the core engine
+MODEL_NAME = "gemini-1.5-flash"
 
-# ================================================
-# PRESERVATION ANCHOR: CORE HELPERS
-# ================================================
-def enhance_image(img):
-    """Preserved logic: Contrast + Sharpen + Token Optimization."""
-    img = img.convert("RGB")
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(3.0)
-    img = img.filter(ImageFilter.SHARPEN)
-    img.thumbnail((1600, 1600))
-    return img
+def initialize_gemini(api_key):
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(MODEL_NAME)
 
-def markdown_to_html(text):
-    """Preserved: HTML formatting for Anki."""
-    text = str(text) # Safety cast
-    text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'__([^_]+)__', r'<b>\1</b>', text)
-    text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)
-    text = re.sub(r'_([^_]+)_', r'<i>\1</i>', text)
-    return text
+def compress_image(image_file):
+    """Reduces image size to save API tokens and prevent exhaustion."""
+    img = Image.open(image_file)
+    # Convert to RGB if necessary
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    
+    # Resize if too large (maintains aspect ratio)
+    max_size = 1024
+    if max(img.size) > max_size:
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+    
+    img_byte_arr = io.BytesIO()
+    img.save(img_byte_arr, format='JPEG', quality=80)
+    return img_byte_arr.getvalue()
 
-# ================================================
-# CATEGORY A: PROMPT AUDIT (NATIVE JSON ENFORCED)
-# ================================================
-SYSTEM_INSTRUCTION = """You are an expert Anki flashcard creator acting as a university professor.
-IMAGE ANALYSIS: Transcribe and analyze the content.
-CHAIN-OF-THOUGHT: Identify core concepts, then generate cards.
+# --- FEATURE 13: OPTIMIZED PROMPT ARCHITECTURE ---
+SYSTEM_PROMPT = """
+Target: Senior Anki Content Creator.
+Task: Extract educational data from the image/text and format into Anki Flashcards.
+Output Format: STRICT JSON ARRAY of objects.
+[{"front": "string", "back": "string"}]
 
-CARD RULES:
-- Questions test understanding/application.
-- Answer uses ONLY <b> and <i> tags. NEVER ** or *.
-- If notes are short, supplement with standard accurate knowledge.
-
-OUTPUT RULES:
-You must return ONLY a JSON array of objects. Exactly like this:
-[
-  {"question": "What is X?", "answer": "X is <b>Y</b>.", "suggested_tags": ["tag1"]}
-]
+Rules:
+1. Identify the core concept (e.g., Algebra, Variables).
+2. Create "Atomic" cards (one idea per card).
+3. For math: Use LaTeX style if needed or clear plain text.
+4. Language: Match the input language (e.g., Malay/Indonesian for this user).
+5. Chain-of-Thought: First, identify the rules mentioned (like 'symbols must represent the same value'), then create the card.
 """
 
-# ================================================
-# SIDEBAR CONFIGURATION
-# ================================================
+# --- UI INTERFACE ---
+st.title("🚀 Expert Gemini Anki Generator")
+st.markdown("### Feature-Enhanced Version (v2.0)")
+
 with st.sidebar:
-    st.title("⚙️ Configuration")
+    st.header("Settings")
+    api_key = st.text_input("Enter Gemini API Key", type="password")
+    st.info("Optimization: Images are compressed before being sent to save API tokens.")
+
+uploaded_file = st.file_uploader("Upload your notes (Image)", type=["png", "jpg", "jpeg"])
+
+if uploaded_file and api_key:
+    if st.button("Generate Flashcards"):
+        model = initialize_gemini(api_key)
+        
+        # FEATURE 4: PROGRESS ORCHESTRATOR
+        with st.status("Processing your notes...", expanded=True) as status:
+            st.write("Compressing image for token efficiency...")
+            optimized_image_bytes = compress_image(uploaded_file)
+            
+            st.write("Gemini 1.5 Flash analyzing content...")
+            # Preparing the payload
+            contents = [
+                SYSTEM_PROMPT,
+                {"mime_type": "image/jpeg", "data": optimized_image_bytes}
+            ]
+            
+            try:
+                response = model.generate_content(contents)
+                
+                # FEATURE 3: DATA PERSISTENCE
+                raw_text = response.text
+                # Clean JSON in case model adds backticks
+                clean_json = raw_text.replace("```json", "").replace("```", "").strip()
+                st.session_state.generated_cards = json.loads(clean_json)
+                
+                status.update(label="Flashcards Generated!", state="complete", expanded=False)
+            except Exception as e:
+                st.error(f"API Error: {str(e)}")
+                status.update(label="Error Occurred", state="error")
+
+# --- FEATURE 5 & 20: OUTPUT & BATCH DISPLAY ---
+if st.session_state.generated_cards:
+    st.divider()
+    st.subheader("Generated Anki Cards")
     
-    try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-        st.success("✅ API Key loaded from Secrets")
-    except:
-        api_key = st.text_input("Gemini API Key:", type="password")
-        st.info("💡 Tip: Add 'GEMINI_API_KEY' to your Streamlit Secrets.")
+    # Show cards in a clean grid
+    cols = st.columns(2)
+    for idx, card in enumerate(st.session_state.generated_cards):
+        with cols[idx % 2]:
+            with st.container(border=True):
+                st.markdown(f"**Front:** {card['front']}")
+                st.markdown(f"**Back:** {card['back']}")
+
+    # Export Options
+    st.divider()
+    col_dl1, col_dl2 = st.columns(2)
     
-    subject = st.text_input("Subject:", value="Biology")
-    fixed_tag = st.text_input("Fixed Tag (Auto-sanitized):", value="#Medical_2024").replace(" ", "_")
-    language = st.selectbox("Language:", ["English", "Bahasa Indonesia", "Bilingual (En+Indo)"])
-    card_target = st.slider("Target Cards per Image:", min_value=5, max_value=30, value=15)
+    # Create TXT for Anki Import
+    anki_txt = "\n".join([f"{c['front']};{c['back']}" for c in st.session_state.generated_cards])
     
-    if st.button("🗑️ Clear Memory & Reset"):
-        st.session_state['generated_cards'] = []
+    col_dl1.download_button(
+        label="Download for Anki (.txt import)",
+        data=anki_txt,
+        file_name="anki_cards.txt",
+        mime="text/plain"
+    )
+    
+    if col_dl2.button("Clear All Cards"):
+        st.session_state.generated_cards = []
         st.rerun()
 
-    st.divider()
-    st.info("Model: gemini-2.5-flash-lite")
-
-# ================================================
-# MAIN UI & LOGIC
-# ================================================
-st.title("🎓 AI Anki Flashcard Generator PRO")
-
-uploaded_files = st.file_uploader("📸 Upload Image(s)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
-
-if uploaded_files:
-    if not api_key:
-        st.warning("⚠️ Please provide an API Key in the sidebar or secrets to continue.")
-    else:
-        if st.button("🚀 Process & Generate Cards"):
-            genai.configure(api_key=api_key)
-            
-            # Category A: Native JSON Mode enabled here
-            model = genai.GenerativeModel(
-                model_name='gemini-2.5-flash-lite',
-                system_instruction=SYSTEM_INSTRUCTION,
-                generation_config={"response_mime_type": "application/json"}
-            )
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            new_cards_count = 0
-            
-            for idx, file in enumerate(uploaded_files):
-                status_text.text(f"Processing image {idx+1}/{len(uploaded_files)}...")
-                
-                raw_img = Image.open(file)
-                enhanced_img = enhance_image(raw_img)
-                
-                lang_instr = f"Language: {language}."
-                prompt = f"Subject: {subject}. {lang_instr} Generate approximately {card_target} Anki cards based on this image."
-                
-                try:
-                    with st.spinner(f'AI analyzing {file.name}...'):
-                        response = model.generate_content([enhanced_img, prompt])
-                        
-                        # Because we used Native JSON mode, response.text is guaranteed to be a JSON string
-                        cards_data = json.loads(response.text)
-                        
-                        for card in cards_data:
-                            formatted_answer = markdown_to_html(card.get('answer', ''))
-                            tags = [fixed_tag] + card.get('suggested_tags', [])
-                            tag_str = " ".join([t.replace(" ", "_") for t in tags])
-                            
-                            # Append to SESSION STATE (Lifesaver)
-                            st.session_state['generated_cards'].append({
-                                "Question": card.get('question', ''),
-                                "Answer": formatted_answer,
-                                "Tags": tag_str
-                            })
-                            new_cards_count += 1
-                            
-                except Exception as e:
-                    st.error(f"Error in {file.name}: {str(e)}")
-                
-                progress_bar.progress((idx + 1) / len(uploaded_files))
-                
-                # Category C: API Rate Guard (Protect free tier on multiple images)
-                if idx < len(uploaded_files) - 1:
-                    time.sleep(2)
-            
-            status_text.text("✅ Generation Complete!")
-            st.toast(f"{new_cards_count} new cards added to memory!")
-
-# ================================================
-# REVIEW & EXPORT SECTION
-# ================================================
-if st.session_state['generated_cards']:
-    st.divider()
-    st.subheader(f"📝 Review & Edit ({len(st.session_state['generated_cards'])} Cards Total)")
-    
-    # Category B: Interactive Data Editor
-    st.info("💡 You can click inside the table below to edit typos or change tags before downloading!")
-    
-    # Convert session state to pandas dataframe for the editor
-    df = pd.DataFrame(st.session_state['generated_cards'])
-    edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
-    
-    # Sync edits back to session state in case they add/delete rows
-    st.session_state['generated_cards'] = edited_df.to_dict('records')
-
-    # Visual Preview (Top 3)
-    with st.expander("👀 View Visual Anki Card Preview"):
-        for c in st.session_state['generated_cards'][:3]:
-            st.markdown(f"""
-                <div class="anki-card">
-                    <div class="anki-front">{c['Question']}</div>
-                    <div class="anki-back">{c['Answer']}</div>
-                    <div style="margin-top:10px;"><span class="tag-pill">{c['Tags']}</span></div>
-                </div>
-            """, unsafe_allow_html=True)
-            
-    # CSV Preparation
-    output = io.StringIO()
-    writer = csv.writer(output)
-    for c in st.session_state['generated_cards']:
-        writer.writerow([c['Question'], c['Answer'], c['Tags']])
-    
-    # Category D: Dynamic Filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    safe_subject = re.sub(r'[^a-zA-Z0-9]', '_', subject.lower())
-    filename = f"{safe_subject}_anki_{timestamp}.csv"
-    
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        st.download_button(
-            label="📥 Download Anki CSV",
-            data=output.getvalue(),
-            file_name=filename,
-            mime="text/csv",
-            type="primary"
-        )
-    with col2:
-        with st.popover("ℹ️ How to Import into Anki"):
-            st.write("1. File → Import → select the downloaded `.csv`")
-            st.write("2. Field 1=Front, Field 2=Back, Field 3=Tags")
-            st.write("3. **Crucial:** Check 'Allow HTML in fields'")
-
+elif uploaded_file:
+    st.info("Click 'Generate Flashcards' to begin analysis.")
