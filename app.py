@@ -27,7 +27,6 @@ if 'generated_cards' not in st.session_state:
 if 'preview_page' not in st.session_state:
     st.session_state['preview_page'] = 0
 
-# Custom CSS for Anki-like Previews and Batch UI
 st.markdown("""
     <style>
     .anki-card { background-color: #2e2e2e; border-radius: 10px; padding: 20px; border: 1px solid #444; margin-bottom: 10px; font-family: Arial; }
@@ -50,33 +49,34 @@ def enhance_image(img):
     return img
 
 def markdown_to_html(text):
+    """Enhanced LaTeX escaping for Anki MathJax"""
     text = str(text)
+    # Standard Markdown
     text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__([^_]+)__', r'<b>\1</b>', text)
     text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)
     text = re.sub(r'_([^_]+)_', r'<i>\1</i>', text)
-    # Feature 4: MathJax/LaTeX Anki Escaping
-    text = re.sub(r'\$\$(.*?)\$\$', r'\\[\1\\]', text, flags=re.DOTALL)
-    text = re.sub(r'\$(.*?)\$', r'\\(\1\\)', text)
+    
+    # LaTeX: Convert $$...$$ to \[...\] and $...$ to \(...\)
+    # Using double backslashes to ensure they survive the string transfer into the APKG
+    text = re.sub(r'\$\$(.*?)\$\$', r'\\[ \1 \\]', text, flags=re.DOTALL)
+    text = re.sub(r'\$([^\$]+)\$', r'\\( \1 \\)', text)
     return text
 
 def is_duplicate(new_q, existing_cards, threshold=0.85):
-    """Feature 13: Deduplication Engine"""
     for c in existing_cards:
         if difflib.SequenceMatcher(None, new_q.lower(), c['Question'].lower()).ratio() > threshold:
             return True
     return False
 
 # ================================================
-# ANKI .APKG EXPORT ENGINE (Features 1, 3, 5, 15)
+# ANKI .APKG EXPORT ENGINE
 # ================================================
 ANKI_CSS = """
 .card { font-family: Arial; font-size: 20px; text-align: center; color: black; background-color: white; }
 .card.nightMode { background-color: #272828; color: #e2e2e2; }
 .context { font-size: 16px; color: #555; margin-top: 20px; font-style: italic; border-top: 1px solid #ccc; padding-top: 10px; }
 .card.nightMode .context { color: #aaa; border-top: 1px solid #555; }
-.cloze { font-weight: bold; color: blue; }
-.card.nightMode .cloze { color: #00aaff; }
 """
 
 BASIC_MODEL_ID = 1607392319
@@ -105,7 +105,7 @@ anki_cloze_model = genanki.Model(
     css=ANKI_CSS
 )
 
-def generate_apkg(cards, deck_name, include_audio):
+def generate_apkg(cards, deck_name, include_audio, lang_code):
     deck_id = hash(deck_name) % (10**10) 
     deck = genanki.Deck(deck_id, deck_name)
     media_files = []
@@ -115,11 +115,15 @@ def generate_apkg(cards, deck_name, include_audio):
             audio_field = ""
             if include_audio:
                 try:
+                    # Logic: If Cloze, read the text. If Basic, read the answer.
                     text_to_read = c['Answer'] if ('Answer' in c and c['Answer']) else c['Question']
+                    # Clean HTML and LaTeX for TTS
                     clean_text = re.sub(r'<[^>]+>', '', str(text_to_read))
+                    clean_text = re.sub(r'\\\[|\\\]|\\\(|\\\)', '', clean_text)
+                    
                     if clean_text.strip():
-                        tts = gTTS(clean_text, lang='en')
-                        filename = f"anki_audio_{deck_id}_{idx}.mp3"
+                        tts = gTTS(clean_text, lang=lang_code)
+                        filename = f"audio_{idx}_{int(time.time())}.mp3"
                         filepath = os.path.join(tmpdir, filename)
                         tts.save(filepath)
                         media_files.append(filepath)
@@ -145,32 +149,36 @@ def generate_apkg(cards, deck_name, include_audio):
 # ================================================
 # PROMPT LOGIC & BATCH ENGINE
 # ================================================
-BASE_SYSTEM_INSTRUCTION = """You are an expert Anki flashcard creator acting as a university professor.
-IMAGE ANALYSIS: Transcribe and analyze the content accurately.
+BASE_SYSTEM_INSTRUCTION = """You are an expert Anki professor.
+IMAGE ANALYSIS: Transcribe accurately. 
 
-CARD RULES (MINIMUM INFORMATION PRINCIPLE):
-- Facts must be atomic, singular, and impossible to misunderstand.
-- [REVERSE CARDS]: If a core definition is found, generate both "Term -> Def" and "Def -> Term".
-- [BREVITY]: Answers must be extremely concise (under 15 words).
-- [CONTEXT]: Put all explanatory background information or formulas into the "context" field.
-- [CONFIDENCE]: Provide a confidence_score (0-100).
+MATH/SCIENCE RULES:
+- IMPORTANT: Use LaTeX for ALL mathematical formulas, chemical equations, or variables.
+- Inline math: Use $...$ (e.g. $E=mc^2$).
+- Block math: Use $$...$$ for complex formulas.
+
+CARD RULES:
+- Facts must be atomic.
+- [REVERSE CARDS]: Generate both directions for definitions.
+- [BREVITY]: Answers < 15 words.
+- [CONTEXT]: Background info goes in the "context" field.
 
 OUTPUT RULES:
-Return ONLY a JSON array of objects:
-[{"question": "string", "answer": "string", "context": "string", "suggested_tags": ["tag1"], "confidence_score": integer}]
+Return ONLY a JSON array:
+[{"question": "string", "answer": "string", "context": "string", "suggested_tags": ["tag"], "confidence_score": 95}]
 """
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def process_single_image(file, model, prompt_suffix):
     raw_img = Image.open(file)
     enhanced_img = enhance_image(raw_img)
-    full_prompt = f"Subject: {subject}. {prompt_suffix} Generate Anki cards in JSON."
+    full_prompt = f"Subject: {subject}. {prompt_suffix}"
     response = model.generate_content([enhanced_img, full_prompt])
     clean_json = re.sub(r'```json|```', '', response.text).strip()
     return json.loads(clean_json)
 
 # ================================================
-# SIDEBAR CONFIGURATION
+# SIDEBAR & UI
 # ================================================
 with st.sidebar:
     st.title("⚙️ Configuration")
@@ -180,46 +188,41 @@ with st.sidebar:
     except:
         api_key = st.text_input("Gemini API Key:", type="password")
     
-    subject = st.text_input("Subject:", value="Biology")
-    fixed_tag = st.text_input("Fixed Tag:", value="#Medical_2024").replace(" ", "_")
+    subject = st.text_input("Subject:", value="Medical Science")
+    fixed_tag = st.text_input("Fixed Tag:", value="#Study_2024").replace(" ", "_")
     language = st.selectbox("Language:", ["English", "Bahasa Indonesia", "Bilingual"])
-    eli5_mode = st.checkbox("Simplify Explanations (ELI5)")
+    
+    # TTS Language Mapping
+    LANG_MAP = {"English": "en", "Bahasa Indonesia": "id", "Bilingual": "id"}
+    current_lang_code = LANG_MAP.get(language, "en")
+
+    eli5_mode = st.checkbox("ELI5 (Simple Context)")
     cloze_mode = st.checkbox("Enable Cloze Deletions")
     
-    if st.button("🗑️ Clear All Memory"):
+    if st.button("🗑️ Clear Memory"):
         st.session_state['generated_cards'] = []
-        st.session_state['preview_page'] = 0
         st.rerun()
-    st.info("MODEL STASIS: gemini-2.5-flash-lite")
+    st.info("MODEL: gemini-2.5-flash-lite")
 
-# ================================================
-# MAIN UI
-# ================================================
 st.title("🎓 AI Anki Generator PRO")
 
-uploaded_files = st.file_uploader("📸 Batch Upload Images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
-if uploaded_files:
-    est_tokens = len(uploaded_files) * 258 + 500
-    st.info(f"ℹ️ Token Estimate: ~{est_tokens} (Safe)")
+uploaded_files = st.file_uploader("📸 Batch Upload", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 
 if uploaded_files and api_key:
     if st.button("🚀 Process Batch"):
         genai.configure(api_key=api_key)
         instruction = BASE_SYSTEM_INSTRUCTION
-        if cloze_mode:
-            instruction += "\nCLOZE MODE ACTIVE: Format 'question' as a cloze sentence {{c1::like this}}."
+        if cloze_mode: instruction += "\nCLOZE MODE: 'question' must contain {{c1::...}}."
 
         model = genai.GenerativeModel(model_name='gemini-2.5-flash-lite', system_instruction=instruction, generation_config={"response_mime_type": "application/json"})
-        prompt_suffix = f"Language: {language}. {'ELI5 mode.' if eli5_mode else ''}"
+        prompt_suffix = f"Language: {language}. Output JSON."
 
-        max_threads = min(len(uploaded_files), 5)
-        with st.status(f"Processing...", expanded=True) as status:
-            with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        with st.status("Generating Cards...", expanded=True) as status:
+            with ThreadPoolExecutor(max_workers=min(len(uploaded_files), 5)) as executor:
                 futures = [executor.submit(process_single_image, f, model, prompt_suffix) for f in uploaded_files]
                 for future in futures:
                     try:
-                        result = future.result()
-                        for card in result:
+                        for card in future.result():
                             if not is_duplicate(card.get('question', ''), st.session_state['generated_cards']):
                                 st.session_state['generated_cards'].append({
                                     "Question": markdown_to_html(card.get('question', '')),
@@ -228,54 +231,29 @@ if uploaded_files and api_key:
                                     "Tags": f"{fixed_tag} {' '.join(card.get('suggested_tags', []))}",
                                     "Confidence": card.get('confidence_score', 0)
                                 })
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
-            status.update(label="✅ Batch Processing Complete!", state="complete")
+                    except Exception as e: st.error(f"Error: {e}")
+            status.update(label="✅ Complete!", state="complete")
 
-# ================================================
-# REVIEW & EXPORT
-# ================================================
 if st.session_state['generated_cards']:
-    st.divider()
     df = pd.DataFrame(st.session_state['generated_cards'])
-    df = df.sort_values(by="Confidence", ascending=True).reset_index(drop=True)
-    edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+    edited_df = st.data_editor(df.sort_values(by="Confidence"), use_container_width=True, num_rows="dynamic")
     st.session_state['generated_cards'] = edited_df.to_dict('records')
 
-    # Pagination
-    total_cards = len(st.session_state['generated_cards'])
-    cards_per_page = 5
-    max_pages = max(1, (total_cards + cards_per_page - 1) // cards_per_page)
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
+    # Preview
+    st.subheader("👀 Preview")
+    for c in st.session_state['generated_cards'][:3]:
+        st.markdown(f"""<div class="anki-card"><div>{c['Question']}</div><div style="color:#00aaff;">{c['Answer']}</div><div style="font-size:0.8em; opacity:0.7;">{c['Context']}</div></div>""", unsafe_allow_html=True)
+
+    # Export
+    st.subheader("📥 Export")
+    col1, col2 = st.columns(2)
     with col1:
-        if st.button("⬅️ Previous") and st.session_state['preview_page'] > 0:
-            st.session_state['preview_page'] -= 1
-            st.rerun()
+        include_audio = st.checkbox("Enable TTS Audio (Uses Sidebar Language)")
+        if st.button("📦 Download .apkg", type="primary"):
+            data = generate_apkg(st.session_state['generated_cards'], subject, include_audio, current_lang_code)
+            st.download_button("Save File", data, file_name=f"{subject}.apkg", mime="application/octet-stream")
     with col2:
-        st.write(f"<center>Page {st.session_state['preview_page'] + 1} of {max_pages}</center>", unsafe_allow_html=True)
-    with col3:
-        if st.button("Next ➡️") and st.session_state['preview_page'] < max_pages - 1:
-            st.session_state['preview_page'] += 1
-            st.rerun()
-
-    start_idx = st.session_state['preview_page'] * cards_per_page
-    for c in st.session_state['generated_cards'][start_idx : start_idx + cards_per_page]:
-        st.markdown(f"""<div class="anki-card"><div class="anki-front">{c['Question']}</div><div class="anki-back">{c['Answer']}</div><div class="anki-context">{c['Context']}</div><div style="margin-top:10px;"><span class="tag-pill">{c['Tags']}</span></div></div>""", unsafe_allow_html=True)
-
-    st.subheader("📥 Export Options")
-    export_col1, export_col2 = st.columns(2)
-    with export_col1:
+        # CSV Fallback
         output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['Question', 'Answer', 'Context', 'Tags'])
-        for c in st.session_state['generated_cards']:
-            writer.writerow([c['Question'], c['Answer'], c['Context'], c['Tags']])
-        st.download_button("📥 Download CSV", output.getvalue(), file_name=f"{subject}.csv", mime="text/csv", use_container_width=True)
-
-    with export_col2:
-        include_audio = st.checkbox("Include TTS Audio", value=False)
-        if st.button("📦 Download .apkg", type="primary", use_container_width=True):
-            with st.spinner("Building .apkg..."):
-                apkg_data = generate_apkg(st.session_state['generated_cards'], subject, include_audio)
-                st.download_button("Click to Save .apkg", apkg_data, file_name=f"{subject}.apkg", mime="application/octet-stream", use_container_width=True)
+        pd.DataFrame(st.session_state['generated_cards']).to_csv(output, index=False)
+        st.download_button("📥 Download CSV", output.getvalue(), file_name=f"{subject}.csv", mime="text/csv")
