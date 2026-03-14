@@ -1,0 +1,8 @@
+streamlit==1.32.2
+google-generativeai==0.4.1
+Pillow==10.2.0
+pandas==2.2.1
+genanki==0.13.0
+gTTS==2.5.1
+filelock==3.13.1
+
