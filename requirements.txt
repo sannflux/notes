@@ -1,7 +1,7 @@
 streamlit
-google-generativeai>=0.5.0
+google-generativeai
 Pillow
 pandas
-genanki==0.13.1
+genanki
 gTTS
 tenacity
