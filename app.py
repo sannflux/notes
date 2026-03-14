@@ -5,13 +5,20 @@ import csv
 import io
 import re
 import json
+import time
+from datetime import datetime
+import pandas as pd
 
 # ================================================
 # CONFIGURATION & THEME
 # ================================================
 st.set_page_config(page_title="AI Anki Generator PRO", page_icon="🎓", layout="wide")
 
-# Custom CSS for Anki-like Previews and Dark Mode UI
+# Initialize Session State for preserving cards across Streamlit reruns
+if 'generated_cards' not in st.session_state:
+    st.session_state['generated_cards'] = []
+
+# Custom CSS for Anki-like Previews
 st.markdown("""
     <style>
     .anki-card {
@@ -32,17 +39,17 @@ st.markdown("""
 # PRESERVATION ANCHOR: CORE HELPERS
 # ================================================
 def enhance_image(img):
-    """Preserved logic: Contrast + Sharpen."""
+    """Preserved logic: Contrast + Sharpen + Token Optimization."""
     img = img.convert("RGB")
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(3.0)
     img = img.filter(ImageFilter.SHARPEN)
-    # Optimization: Resize for token efficiency
     img.thumbnail((1600, 1600))
     return img
 
 def markdown_to_html(text):
     """Preserved: HTML formatting for Anki."""
+    text = str(text) # Safety cast
     text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__([^_]+)__', r'<b>\1</b>', text)
     text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)
@@ -50,9 +57,9 @@ def markdown_to_html(text):
     return text
 
 # ================================================
-# CATEGORY A: PROMPT AUDIT (JSON + COT)
+# CATEGORY A: PROMPT AUDIT (NATIVE JSON ENFORCED)
 # ================================================
-SYSTEM_INSTRUCTION = """You are an expert Anki flashcard creator.
+SYSTEM_INSTRUCTION = """You are an expert Anki flashcard creator acting as a university professor.
 IMAGE ANALYSIS: Transcribe and analyze the content.
 CHAIN-OF-THOUGHT: Identify core concepts, then generate cards.
 
@@ -61,9 +68,11 @@ CARD RULES:
 - Answer uses ONLY <b> and <i> tags. NEVER ** or *.
 - If notes are short, supplement with standard accurate knowledge.
 
-OUTPUT RULES (STRICT JSON):
-Return a JSON array of objects ONLY.
-[{"question": "string", "answer": "string", "suggested_tags": ["tag1"]}]
+OUTPUT RULES:
+You must return ONLY a JSON array of objects. Exactly like this:
+[
+  {"question": "What is X?", "answer": "X is <b>Y</b>.", "suggested_tags": ["tag1"]}
+]
 """
 
 # ================================================
@@ -72,25 +81,29 @@ Return a JSON array of objects ONLY.
 with st.sidebar:
     st.title("⚙️ Configuration")
     
-    # API SECRETS INTEGRATION
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.success("✅ API Key loaded from Secrets")
     except:
         api_key = st.text_input("Gemini API Key:", type="password")
-        st.info("💡 Tip: Add 'GEMINI_API_KEY' to your Streamlit Secrets to skip this.")
+        st.info("💡 Tip: Add 'GEMINI_API_KEY' to your Streamlit Secrets.")
     
     subject = st.text_input("Subject:", value="Biology")
-    fixed_tag = st.text_input("Fixed Tag:", value="#Medical_2024")
+    fixed_tag = st.text_input("Fixed Tag (Auto-sanitized):", value="#Medical_2024").replace(" ", "_")
     language = st.selectbox("Language:", ["English", "Bahasa Indonesia", "Bilingual (En+Indo)"])
+    card_target = st.slider("Target Cards per Image:", min_value=5, max_value=30, value=15)
     
+    if st.button("🗑️ Clear Memory & Reset"):
+        st.session_state['generated_cards'] = []
+        st.rerun()
+
     st.divider()
     st.info("Model: gemini-2.5-flash-lite")
 
 # ================================================
 # MAIN UI & LOGIC
 # ================================================
-st.title("🎓 AI Anki Flashcard Generator")
+st.title("🎓 AI Anki Flashcard Generator PRO")
 
 uploaded_files = st.file_uploader("📸 Upload Image(s)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 
@@ -100,14 +113,18 @@ if uploaded_files:
     else:
         if st.button("🚀 Process & Generate Cards"):
             genai.configure(api_key=api_key)
+            
+            # Category A: Native JSON Mode enabled here
             model = genai.GenerativeModel(
                 model_name='gemini-2.5-flash-lite',
-                system_instruction=SYSTEM_INSTRUCTION
+                system_instruction=SYSTEM_INSTRUCTION,
+                generation_config={"response_mime_type": "application/json"}
             )
             
-            all_generated_cards = []
             progress_bar = st.progress(0)
             status_text = st.empty()
+            
+            new_cards_count = 0
             
             for idx, file in enumerate(uploaded_files):
                 status_text.text(f"Processing image {idx+1}/{len(uploaded_files)}...")
@@ -116,59 +133,91 @@ if uploaded_files:
                 enhanced_img = enhance_image(raw_img)
                 
                 lang_instr = f"Language: {language}."
-                prompt = f"Subject: {subject}. {lang_instr} Generate Anki cards in JSON."
+                prompt = f"Subject: {subject}. {lang_instr} Generate approximately {card_target} Anki cards based on this image."
                 
                 try:
-                    with st.spinner('Analyzing content...'):
+                    with st.spinner(f'AI analyzing {file.name}...'):
                         response = model.generate_content([enhanced_img, prompt])
-                        # Clean JSON and parse
-                        clean_json = re.sub(r'```json|```', '', response.text).strip()
-                        cards_data = json.loads(clean_json)
+                        
+                        # Because we used Native JSON mode, response.text is guaranteed to be a JSON string
+                        cards_data = json.loads(response.text)
                         
                         for card in cards_data:
-                            formatted_answer = markdown_to_html(card['answer'])
+                            formatted_answer = markdown_to_html(card.get('answer', ''))
                             tags = [fixed_tag] + card.get('suggested_tags', [])
                             tag_str = " ".join([t.replace(" ", "_") for t in tags])
                             
-                            all_generated_cards.append({
-                                "q": card['question'],
-                                "a": formatted_answer,
-                                "tags": tag_str
+                            # Append to SESSION STATE (Lifesaver)
+                            st.session_state['generated_cards'].append({
+                                "Question": card.get('question', ''),
+                                "Answer": formatted_answer,
+                                "Tags": tag_str
                             })
+                            new_cards_count += 1
+                            
                 except Exception as e:
                     st.error(f"Error in {file.name}: {str(e)}")
                 
                 progress_bar.progress((idx + 1) / len(uploaded_files))
-            
-            status_text.text("✅ Finished!")
-            st.toast("Generation Complete!")
-            
-            if all_generated_cards:
-                st.subheader("👀 Preview (Top 5)")
-                for c in all_generated_cards[:5]:
-                    st.markdown(f"""
-                        <div class="anki-card">
-                            <div class="anki-front">{c['q']}</div>
-                            <div class="anki-back">{c['a']}</div>
-                            <div style="margin-top:10px;"><span class="tag-pill">{c['tags']}</span></div>
-                        </div>
-                    """, unsafe_allow_html=True)
-
-                # CSV Preparation
-                output = io.StringIO()
-                writer = csv.writer(output)
-                for c in all_generated_cards:
-                    writer.writerow([c['q'], c['a'], c['tags']])
                 
-                st.download_button(
-                    label="📥 Download Anki CSV",
-                    data=output.getvalue(),
-                    file_name=f"{subject.lower()}_anki.csv",
-                    mime="text/csv"
-                )
+                # Category C: API Rate Guard (Protect free tier on multiple images)
+                if idx < len(uploaded_files) - 1:
+                    time.sleep(2)
+            
+            status_text.text("✅ Generation Complete!")
+            st.toast(f"{new_cards_count} new cards added to memory!")
 
-# Instructions for Import
-with st.expander("ℹ️ How to Import into Anki"):
-    st.write("1. File → Import → select the .csv")
-    st.write("2. Field 1=Front, Field 2=Back, Field 3=Tags")
-    st.write("3. Check 'Allow HTML in fields'")
+# ================================================
+# REVIEW & EXPORT SECTION
+# ================================================
+if st.session_state['generated_cards']:
+    st.divider()
+    st.subheader(f"📝 Review & Edit ({len(st.session_state['generated_cards'])} Cards Total)")
+    
+    # Category B: Interactive Data Editor
+    st.info("💡 You can click inside the table below to edit typos or change tags before downloading!")
+    
+    # Convert session state to pandas dataframe for the editor
+    df = pd.DataFrame(st.session_state['generated_cards'])
+    edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+    
+    # Sync edits back to session state in case they add/delete rows
+    st.session_state['generated_cards'] = edited_df.to_dict('records')
+
+    # Visual Preview (Top 3)
+    with st.expander("👀 View Visual Anki Card Preview"):
+        for c in st.session_state['generated_cards'][:3]:
+            st.markdown(f"""
+                <div class="anki-card">
+                    <div class="anki-front">{c['Question']}</div>
+                    <div class="anki-back">{c['Answer']}</div>
+                    <div style="margin-top:10px;"><span class="tag-pill">{c['Tags']}</span></div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+    # CSV Preparation
+    output = io.StringIO()
+    writer = csv.writer(output)
+    for c in st.session_state['generated_cards']:
+        writer.writerow([c['Question'], c['Answer'], c['Tags']])
+    
+    # Category D: Dynamic Filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    safe_subject = re.sub(r'[^a-zA-Z0-9]', '_', subject.lower())
+    filename = f"{safe_subject}_anki_{timestamp}.csv"
+    
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.download_button(
+            label="📥 Download Anki CSV",
+            data=output.getvalue(),
+            file_name=filename,
+            mime="text/csv",
+            type="primary"
+        )
+    with col2:
+        with st.popover("ℹ️ How to Import into Anki"):
+            st.write("1. File → Import → select the downloaded `.csv`")
+            st.write("2. Field 1=Front, Field 2=Back, Field 3=Tags")
+            st.write("3. **Crucial:** Check 'Allow HTML in fields'")
+
