@@ -6,11 +6,9 @@ import io
 import re
 import json
 import time
-from datetime import datetime
+import datetime
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor
 import difflib
-from tenacity import retry, stop_after_attempt, wait_exponential
 import genanki
 from gtts import gTTS
 import tempfile
@@ -26,20 +24,32 @@ st.set_page_config(page_title="AI Anki Generator PRO", page_icon="🎓", layout=
 if 'generated_cards' not in st.session_state: st.session_state['generated_cards'] = []
 if 'preview_page' not in st.session_state: st.session_state['preview_page'] = 0
 if 'audio_cache' not in st.session_state: st.session_state['audio_cache'] = {}
-if 'total_api_calls' not in st.session_state: st.session_state['total_api_calls'] = 0
+
+# Idea 12: Persistent RPD (Requests Per Day) Tracker
+TRACKER_FILE = "rpd_tracker.json"
+def load_rpd():
+    today = str(datetime.date.today())
+    if os.path.exists(TRACKER_FILE):
+        with open(TRACKER_FILE, 'r') as f:
+            data = json.load(f)
+            if data.get('date') == today: return data.get('calls', 0)
+    return 0
+
+def increment_rpd(calls=1):
+    today = str(datetime.date.today())
+    current = load_rpd() + calls
+    with open(TRACKER_FILE, 'w') as f:
+        json.dump({'date': today, 'calls': current}, f)
+    return current
+
+if 'rpd_used' not in st.session_state:
+    st.session_state['rpd_used'] = load_rpd()
 
 # Premium Fonts & Adaptive CSS
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
-    .anki-card { 
-        background-color: rgba(128, 128, 128, 0.1); 
-        border-radius: 12px; 
-        padding: 20px; 
-        border: 2px solid #444444; 
-        margin-bottom: 15px;
-        font-family: 'Inter', sans-serif;
-    }
+    .anki-card { background-color: rgba(128, 128, 128, 0.1); border-radius: 12px; padding: 20px; border: 2px solid #444444; margin-bottom: 15px; font-family: 'Inter', sans-serif; }
     .anki-front { font-size: 1.2em; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 10px; margin-bottom: 10px; }
     .anki-back { color: #00aaff; font-size: 1.1em; font-weight: 600; }
     .anki-context { color: gray; font-size: 0.9em; padding-top: 10px; font-style: italic; }
@@ -57,7 +67,8 @@ def enhance_image(img):
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(3.0)
     img = img.filter(ImageFilter.SHARPEN)
-    img.thumbnail((1200, 1200))
+    # Aggressive Token Downscaling to fit multiple images per request
+    img.thumbnail((768, 768)) 
     return img
 
 def markdown_to_html(text):
@@ -72,8 +83,7 @@ def markdown_to_html(text):
 
 def is_duplicate(new_q, existing_cards, threshold=0.85):
     for c in existing_cards:
-        if difflib.SequenceMatcher(None, new_q.lower(), str(c['Question']).lower()).ratio() > threshold:
-            return True
+        if difflib.SequenceMatcher(None, new_q.lower(), str(c['Question']).lower()).ratio() > threshold: return True
     return False
 
 # ================================================
@@ -94,18 +104,13 @@ BASIC_MODEL_ID = 1607392319
 CLOZE_MODEL_ID = 1607392320
 
 anki_basic_model = genanki.Model(
-    BASIC_MODEL_ID, 'AI Anki PRO Basic',
-    fields=[{'name': 'Question'}, {'name': 'Answer'}, {'name': 'Context'}, {'name': 'Audio'}],
-    templates=[{'name': 'Card 1', 'qfmt': '{{Question}}', 'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'}],
-    css=ANKI_CSS
+    BASIC_MODEL_ID, 'AI Anki PRO', fields=[{'name': 'Question'}, {'name': 'Answer'}, {'name': 'Context'}, {'name': 'Audio'}],
+    templates=[{'name': 'Card 1', 'qfmt': '{{Question}}', 'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'}], css=ANKI_CSS
 )
 
 anki_cloze_model = genanki.Model(
-    CLOZE_MODEL_ID, 'AI Anki PRO Cloze',
-    model_type=genanki.Model.CLOZE,
-    fields=[{'name': 'Text'}, {'name': 'Context'}, {'name': 'Audio'}],
-    templates=[{'name': 'Cloze', 'qfmt': '{{cloze:Text}}', 'afmt': '{{cloze:Text}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'}],
-    css=ANKI_CSS
+    CLOZE_MODEL_ID, 'AI Anki Cloze', model_type=genanki.Model.CLOZE, fields=[{'name': 'Text'}, {'name': 'Context'}, {'name': 'Audio'}],
+    templates=[{'name': 'Cloze', 'qfmt': '{{cloze:Text}}', 'afmt': '{{cloze:Text}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'}], css=ANKI_CSS
 )
 
 def generate_apkg(cards, deck_name, include_audio, lang_code):
@@ -121,7 +126,6 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
                     text_to_read = c['Answer'] if (c.get('Answer')) else c['Question']
                     clean_text = re.sub(r'<[^>]+>', '', str(text_to_read))
                     clean_text = re.sub(r'\\\[|\\\]|\\\(|\\\)', '', clean_text).strip()
-                    
                     if clean_text:
                         cache_key = hash(clean_text + lang_code)
                         filename = f"audio_{cache_key}.mp3"
@@ -133,16 +137,13 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
                             tts = gTTS(clean_text, lang=lang_code)
                             tts.save(filepath)
                             with open(filepath, 'rb') as f: st.session_state['audio_cache'][cache_key] = f.read()
-                                
                         media_files.append(filepath)
                         audio_field = f"[sound:{filename}]"
                 except: pass 
             
             tags = [t.strip().replace("#", "") for t in str(c['Tags']).split() if t.strip()]
-            if "{{c" in str(c['Question']):
-                note = genanki.Note(model=anki_cloze_model, fields=[str(c['Question']), str(c['Context']), audio_field], tags=tags)
-            else:
-                note = genanki.Note(model=anki_basic_model, fields=[str(c['Question']), str(c['Answer']), str(c['Context']), audio_field], tags=tags)
+            if "{{c" in str(c['Question']): note = genanki.Note(model=anki_cloze_model, fields=[str(c['Question']), str(c['Context']), audio_field], tags=tags)
+            else: note = genanki.Note(model=anki_basic_model, fields=[str(c['Question']), str(c['Answer']), str(c['Context']), audio_field], tags=tags)
             deck.add_note(note)
 
         package = genanki.Package(deck)
@@ -152,31 +153,51 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
         with open(temp_apkg, "rb") as f: return f.read()
 
 # ================================================
-# PROMPT LOGIC & THREAD ENGINE (Rate-Limit Safe)
+# SUPER-BATCH PROMPT LOGIC & SALVAGE ENGINE
 # ================================================
-BASE_SYSTEM_INSTRUCTION = """You are an expert Anki professor. Transcribe and analyze the input. 
+BASE_SYSTEM_INSTRUCTION = """You are an expert Anki professor processing a massive batch of inputs. 
 
-CHEMISTRY/MATH RULES:
-- Use LaTeX for ALL math. Inline: $...$, Block: $$. . .$$
-- Chemistry: Use \\ce{...} for equations.
+CHEMISTRY/MATH RULES: Use LaTeX for ALL math. Inline: $...$, Block: $$. . .$$
+Chemistry: Use \\ce{...} for equations.
 
 CARD RULES:
-- Atomic facts only. 
+- Facts must be atomic. 
 - [REVERSE CARDS]: If definition, generate Term->Def and Def->Term.
 - [BREVITY]: Answers < 15 words.
 - [CONTEXT]: Elaboration goes here. If tabular data exists, format it using HTML <table>, <tr>, <td> tags here.
 - [HIGHLIGHT]: Wrap the single most critical keyword in the 'answer' field with <span style="color: #ffeb3b;">.
 
-OUTPUT: JSON array [{"question", "answer", "context", "distractors": ["wrong1", "wrong2", "wrong3"], "suggested_tags", "confidence_score"}]
+CRITICAL: Return a JSON array of objects. Schema:
+[{"question": "string", "answer": "string", "context": "string", "distractors": ["wrong1"], "suggested_tags": ["tag"], "confidence_score": 95}]
 """
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def process_payload(payload, model, prompt_suffix, is_image=True):
-    full_prompt = f"{prompt_suffix}"
-    content = [payload, full_prompt] if is_image else [full_prompt, payload]
+def extract_partial_json(text_response):
+    """Idea 9: Partial JSON Salvage. Rescues valid objects even if the response was cut off by limits."""
+    cards = []
+    # Find anything that looks like a JSON object inside the array
+    matches = re.findall(r'\{[^{}]*\}', text_response)
+    for match in matches:
+        try:
+            card = json.loads(match)
+            if 'question' in card and 'answer' in card:
+                cards.append(card)
+        except json.JSONDecodeError: pass
+    return cards
+
+def process_super_batch(payloads, model, prompt_suffix, is_image=True):
+    """Processes MULTIPLE payloads in ONE request to save Quota."""
+    full_prompt = f"{prompt_suffix}\nExtract flashcards from ALL provided {'images' if is_image else 'text'}."
+    content = payloads + [full_prompt] if is_image else [full_prompt, payloads]
+    
     response = model.generate_content(content)
     clean_json = re.sub(r'```json|```', '', response.text).strip()
-    return json.loads(clean_json)
+    
+    try:
+        return json.loads(clean_json) # Try normal parse
+    except json.JSONDecodeError:
+        # If Gemini cut off early, salvage what we can to not waste the request
+        st.warning("API output was cut off (Token limit). Salvaging successfully generated cards...")
+        return extract_partial_json(clean_json)
 
 # ================================================
 # SIDEBAR CONFIGURATION
@@ -197,26 +218,29 @@ with st.sidebar:
     st.divider()
     cloze_mode = st.checkbox("Enable Cloze Deletions")
     mcq_mode = st.checkbox("Enable Multiple Choice (MCQ)") 
-    eli5_mode = st.checkbox("ELI5 (Simple Context)")
     
     st.divider()
-    st.subheader("📊 Session Analytics")
-    st.metric("Total Cards Generated", len(st.session_state['generated_cards']))
-    st.metric("API Calls Made", st.session_state['total_api_calls'])
+    # Idea 12 & 10: Strict RPD Tracker UI
+    st.subheader("📊 API Quota Tracker")
+    rpd_val = st.session_state['rpd_used']
+    st.progress(min(rpd_val / 20.0, 1.0))
+    st.markdown(f"**Used Today:** {rpd_val} / 20 Requests")
+    
+    if rpd_val >= 20:
+        st.error("🚨 Daily Limit Exceeded. Try again tomorrow or use a different API key.")
+        api_key = None # Hard lock
     
     st.divider()
-    if st.button("🗑️ Reset Application"):
+    if st.button("🗑️ Reset Memory"):
         st.session_state['generated_cards'] = []
         st.session_state['audio_cache'] = {}
-        st.session_state['total_api_calls'] = 0
         st.rerun()
 
 # ================================================
-# MAIN PROCESSING (Multi-Modal Tabs)
+# MAIN PROCESSING (Super-Batching logic)
 # ================================================
 st.title("🎓 AI Anki Generator PRO")
 
-# Setup Model Logic
 instruction = BASE_SYSTEM_INSTRUCTION
 if cloze_mode: instruction += "\nCLOZE MODE: 'question' must contain {{c1::...}}."
 if mcq_mode: instruction += "\nMULTIPLE CHOICE MODE: You MUST provide 3 realistic wrong answers in the 'distractors' array."
@@ -227,93 +251,100 @@ if api_key:
     model = genai.GenerativeModel(
         model_name='gemini-2.5-flash-lite', 
         system_instruction=instruction,
-        generation_config={"response_mime_type": "application/json"}
     )
 
 prompt_suffix = f"Subject: {subject}. Language: {language}."
-tab_img, tab_txt = st.tabs(["📸 Image Batch (OCR/Math)", "📝 Text/Notes Batch"])
+tab_img, tab_txt = st.tabs(["📸 Image Super-Batch", "📝 Text/Notes Super-Batch"])
 
-# TAB 1: IMAGES
+# TAB 1: IMAGES (Grouped)
 with tab_img:
-    uploaded_files = st.file_uploader("Upload Images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload Images (Groups of 10 recommended)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
     if uploaded_files and api_key:
+        req_needed = max(1, len(uploaded_files) // 10 + (1 if len(uploaded_files) % 10 > 0 else 0))
+        st.info(f"ℹ️ Sending {len(uploaded_files)} images will consume exactly **{req_needed} API Request(s)**.")
+        
         if st.button("🚀 Generate from Images", type="primary"):
-            with st.status("Processing Images...", expanded=True) as status:
-                st.session_state['total_api_calls'] += len(uploaded_files)
-                # Max workers capped at 5 to prevent ResourceExhausted
-                with ThreadPoolExecutor(max_workers=min(len(uploaded_files), 5)) as executor:
-                    futures = []
-                    for f in uploaded_files:
-                        img = enhance_image(Image.open(f))
-                        futures.append(executor.submit(process_payload, img, model, prompt_suffix, True))
+            with st.status(f"Processing in {req_needed} super-batch request(s)...", expanded=True) as status:
+                
+                # Split files into chunks of 10
+                chunk_size = 10
+                for i in range(0, len(uploaded_files), chunk_size):
+                    chunk = uploaded_files[i:i + chunk_size]
+                    processed_imgs = [enhance_image(Image.open(f)) for f in chunk]
                     
-                    for future in futures:
-                        try:
-                            cards = future.result()
-                            for card in cards:
-                                new_q = card.get('question', '')
-                                # MCQ Logic
-                                if mcq_mode and card.get('distractors'):
-                                    options = [card.get('answer')] + card.get('distractors')
-                                    random.shuffle(options)
-                                    letters = ['A', 'B', 'C', 'D', 'E']
-                                    mcq_html = "<br><br><div style='text-align:left; margin-left: 20px;'>"
-                                    for i, opt in enumerate(options[:4]):
-                                        mcq_html += f"<b>{letters[i]})</b> {opt}<br>"
-                                    mcq_html += "</div>"
-                                    new_q += mcq_html
+                    try:
+                        cards = process_super_batch(processed_imgs, model, prompt_suffix, is_image=True)
+                        st.session_state['rpd_used'] = increment_rpd(1) # Track request
+                        
+                        for card in cards:
+                            new_q = card.get('question', '')
+                            if mcq_mode and card.get('distractors'):
+                                options = [card.get('answer')] + card.get('distractors')
+                                random.shuffle(options)
+                                letters = ['A', 'B', 'C', 'D', 'E']
+                                mcq_html = "<br><br><div style='text-align:left; margin-left: 20px;'>"
+                                for j, opt in enumerate(options[:4]): mcq_html += f"<b>{letters[j]})</b> {opt}<br>"
+                                mcq_html += "</div>"
+                                new_q += mcq_html
 
-                                if not is_duplicate(new_q, st.session_state['generated_cards']):
-                                    st.session_state['generated_cards'].append({
-                                        "Question": markdown_to_html(new_q),
-                                        "Answer": markdown_to_html(card.get('answer', '')),
-                                        "Context": markdown_to_html(card.get('context', '')),
-                                        "Tags": f"#AI_Generated {' '.join(card.get('suggested_tags', []))}",
-                                        "Confidence": card.get('confidence_score', 0)
-                                    })
-                        except Exception as e:
-                            st.error(f"Error processing image: {str(e)}")
+                            if not is_duplicate(new_q, st.session_state['generated_cards']):
+                                st.session_state['generated_cards'].append({
+                                    "Question": markdown_to_html(new_q),
+                                    "Answer": markdown_to_html(card.get('answer', '')),
+                                    "Context": markdown_to_html(card.get('context', '')),
+                                    "Tags": f"#AI_Generated {' '.join(card.get('suggested_tags', []))}",
+                                    "Confidence": card.get('confidence_score', 0)
+                                })
+                    except Exception as e: st.error(f"Batch Error: {str(e)}")
+                    
+                    # Respect pace if multiple chunks
+                    if len(uploaded_files) > chunk_size: time.sleep(4) 
+                
                 status.update(label="✅ Image Processing Finished!", state="complete")
+                st.rerun()
 
-# TAB 2: TEXT
+# TAB 2: TEXT (Grouped)
 with tab_txt:
     pasted_text = st.text_area("Paste Lecture Notes, Transcripts, or PDF Text:", height=200)
     if pasted_text and api_key:
+        # Process up to 50,000 characters per request
+        req_needed = max(1, len(pasted_text) // 50000 + (1 if len(pasted_text) % 50000 > 0 else 0))
+        st.info(f"ℹ️ Sending {len(pasted_text)} characters will consume exactly **{req_needed} API Request(s)**.")
+        
         if st.button("🚀 Generate from Text", type="primary"):
-            with st.status("Processing Text...", expanded=True) as status:
-                chunk_size = 3000 # Split text into chunks to act like batch images
+            with st.status("Processing Text in massive chunks...", expanded=True) as status:
+                chunk_size = 50000 
                 text_chunks = [pasted_text[i:i+chunk_size] for i in range(0, len(pasted_text), chunk_size)]
-                st.session_state['total_api_calls'] += len(text_chunks)
                 
-                with ThreadPoolExecutor(max_workers=min(len(text_chunks), 5)) as executor:
-                    futures = [executor.submit(process_payload, chunk, model, prompt_suffix, False) for chunk in text_chunks]
-                    for future in futures:
-                        try:
-                            cards = future.result()
-                            for card in cards:
-                                new_q = card.get('question', '')
-                                # MCQ Logic
-                                if mcq_mode and card.get('distractors'):
-                                    options = [card.get('answer')] + card.get('distractors')
-                                    random.shuffle(options)
-                                    letters = ['A', 'B', 'C', 'D', 'E']
-                                    mcq_html = "<br><br><div style='text-align:left; margin-left: 20px;'>"
-                                    for i, opt in enumerate(options[:4]):
-                                        mcq_html += f"<b>{letters[i]})</b> {opt}<br>"
-                                    mcq_html += "</div>"
-                                    new_q += mcq_html
+                for chunk in text_chunks:
+                    try:
+                        cards = process_super_batch(chunk, model, prompt_suffix, is_image=False)
+                        st.session_state['rpd_used'] = increment_rpd(1) # Track Request
+                        
+                        for card in cards:
+                            new_q = card.get('question', '')
+                            if mcq_mode and card.get('distractors'):
+                                options = [card.get('answer')] + card.get('distractors')
+                                random.shuffle(options)
+                                letters = ['A', 'B', 'C', 'D', 'E']
+                                mcq_html = "<br><br><div style='text-align:left; margin-left: 20px;'>"
+                                for j, opt in enumerate(options[:4]): mcq_html += f"<b>{letters[j]})</b> {opt}<br>"
+                                mcq_html += "</div>"
+                                new_q += mcq_html
 
-                                if not is_duplicate(new_q, st.session_state['generated_cards']):
-                                    st.session_state['generated_cards'].append({
-                                        "Question": markdown_to_html(new_q),
-                                        "Answer": markdown_to_html(card.get('answer', '')),
-                                        "Context": markdown_to_html(card.get('context', '')),
-                                        "Tags": f"#AI_Generated {' '.join(card.get('suggested_tags', []))}",
-                                        "Confidence": card.get('confidence_score', 0)
-                                    })
-                        except Exception as e:
-                            st.error(f"Error processing text chunk: {str(e)}")
+                            if not is_duplicate(new_q, st.session_state['generated_cards']):
+                                st.session_state['generated_cards'].append({
+                                    "Question": markdown_to_html(new_q),
+                                    "Answer": markdown_to_html(card.get('answer', '')),
+                                    "Context": markdown_to_html(card.get('context', '')),
+                                    "Tags": f"#AI_Generated {' '.join(card.get('suggested_tags', []))}",
+                                    "Confidence": card.get('confidence_score', 0)
+                                })
+                    except Exception as e: st.error(f"Text Error: {str(e)}")
+                    if len(text_chunks) > 1: time.sleep(4)
+                
                 status.update(label="✅ Text Processing Finished!", state="complete")
+                st.rerun()
 
 # ================================================
 # PREVIEW, EDITS & TTS
@@ -333,8 +364,7 @@ if st.session_state['generated_cards']:
                 if bulk_tag not in c['Tags']: c['Tags'] += f" {bulk_tag}"
             st.rerun()
         if b_col3.button("➖ Remove from All") and bulk_tag:
-            for c in st.session_state['generated_cards']:
-                c['Tags'] = c['Tags'].replace(bulk_tag, "").strip()
+            for c in st.session_state['generated_cards']: c['Tags'] = c['Tags'].replace(bulk_tag, "").strip()
             st.rerun()
 
     st.subheader("👀 Card Preview")
