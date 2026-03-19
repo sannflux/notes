@@ -17,6 +17,7 @@ import hashlib
 import html as html_lib
 import functools
 import requests
+import http.cookiejar
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 # ── YouTube transcript imports ────────────────────────────────────────────────
@@ -45,21 +46,37 @@ if 'apkg_cache'      not in st.session_state: st.session_state['apkg_cache']    
 if 'apkg_hash'       not in st.session_state: st.session_state['apkg_hash']       = None
 if 'undo_stack'      not in st.session_state: st.session_state['undo_stack']      = []
 if 'card_filter'     not in st.session_state: st.session_state['card_filter']     = ""
-if 'cookie_path'     not in st.session_state: st.session_state['cookie_path']     = None  # YouTube cookies
+if 'cookie_path'     not in st.session_state: st.session_state['cookie_path']     = None
 
 # ── Persistent RPD Tracker ────────────────────────────────────────────────────
-TRACKER_FILE  = "rpd_tracker.json"
-_COOKIE_PATH  = "/tmp/yt_cookies.txt"
+TRACKER_FILE = "rpd_tracker.json"
+_COOKIE_PATH = "/tmp/yt_cookies.txt"
 
-# ── Compiled regex patterns (shared by YouTube scraper + app) ─────────────────
-_RE_HTML_TAGS    = re.compile(r'<[^>]+>')
-_RE_WHITESPACE   = re.compile(r'\s+')
-_RE_CAPTIONS     = re.compile(r'"captionTracks"\s*:\s*(\[.*?\])')
+# ── Compiled regex patterns ───────────────────────────────────────────────────
+_RE_HTML_TAGS     = re.compile(r'<[^>]+>')
+_RE_WHITESPACE    = re.compile(r'\s+')
+_RE_CAPTIONS      = re.compile(r'"captionTracks"\s*:\s*(\[.*?\])')
 _RE_ACCESS_DENIED = re.compile(r'Access Denied|edgesuite\.net|Reference #')
-_RE_HTML_BLOCK   = re.compile(r'<HTML.*?>.*?</HTML>', re.IGNORECASE | re.DOTALL)
-_RE_IMG_TAG      = re.compile(r'!\[.*?\]\(.*?\)')
-_RE_LINK         = re.compile(r'\[([^\]]+)\]\([^\)]+\)')
-_RE_MULTILINE    = re.compile(r'\n\s*\n')
+_RE_HTML_BLOCK    = re.compile(r'<HTML.*?>.*?</HTML>', re.IGNORECASE | re.DOTALL)
+_RE_IMG_TAG       = re.compile(r'!\[.*?\]\(.*?\)')
+_RE_LINK          = re.compile(r'\[([^\]]+)\]\([^\)]+\)')
+_RE_MULTILINE     = re.compile(r'\n\s*\n')
+
+# ── Transcript-specific prompt suffix ────────────────────────────────────────
+# Applied only to YouTube transcript input to handle the unique noise
+# characteristics of raw subtitles: filler words, repetition, fragmentation.
+TRANSCRIPT_SUFFIX = (
+    "\n\nINPUT TYPE: Raw video transcript/subtitles. "
+    "IGNORE filler words ('um', 'uh', 'you know', 'like', 'right', 'okay', 'so'), "
+    "self-corrections, off-topic tangents, sponsor segments, and channel plugs. "
+    "Focus ONLY on factual claims, definitions, step-by-step explanations, and "
+    "clearly stated concepts. Reconstruct fragmented or run-on sentences into "
+    "coherent, atomic flashcard content. "
+    "If a concept is repeated multiple times in the transcript, generate only ONE "
+    "card for it — pick the clearest phrasing. "
+    "Do NOT make cards about the speaker's opinions, jokes, or anecdotes unless "
+    "they directly illustrate a factual concept."
+)
 
 
 def load_rpd():
@@ -81,7 +98,7 @@ def increment_rpd(calls=1):
 if 'rpd_used' not in st.session_state:
     st.session_state['rpd_used'] = load_rpd()
 
-# ── B5: MathJax CDN + Full CSS Injection ─────────────────────────────────────
+# ── MathJax CDN + Full CSS Injection ─────────────────────────────────────────
 st.markdown("""
     <script>
     MathJax = {
@@ -202,7 +219,7 @@ def is_duplicate(new_q, existing_cards, threshold=0.85):
 def get_confidence_dot(score):
     try:
         s = int(score)
-        if s >= 80: cls, label = "conf-high", "High"
+        if s >= 80:   cls, label = "conf-high", "High"
         elif s >= 50: cls, label = "conf-med",  "Medium"
         else:         cls, label = "conf-low",  "Low"
         return f'<span class="conf-dot {cls}" title="{label} confidence ({s}%)"></span>'
@@ -212,7 +229,7 @@ def get_confidence_dot(score):
 def get_confidence_tag(score):
     try:
         s = int(score)
-        if s >= 80: return "confidence_high"
+        if s >= 80:   return "confidence_high"
         elif s >= 50: return "confidence_med"
         else:         return "confidence_low"
     except:
@@ -238,20 +255,22 @@ def extract_youtube_id(url: str):
         m = re.search(pattern, url)
         if m:
             return m.group(1)
-    # Bare video ID passed directly
     if re.match(r'^[\w-]{11}$', url.strip()):
         return url.strip()
     return None
 
-@st.cache_resource
 def get_youtube_api(cookie_path: str = None):
     """
-    Returns a YouTubeTranscriptApi instance, optionally authenticated with a
-    Netscape-format cookies.txt file.  Authenticated requests bypass YouTube's
-    bot-detection rate-limiting that causes the 'currently blocking' error.
+    Returns a fresh YouTubeTranscriptApi instance on every call.
 
-    Cached per unique cookie_path string so a new instance is only created
-    when the cookie file changes (not on every transcript call).
+    @st.cache_resource is intentionally NOT used here.  If it were, Streamlit
+    would cache the first unauthenticated instance and never replace it even
+    after the user uploads cookies, because the cached object lives in memory
+    regardless of the cookie_path argument changing.
+
+    Caching is handled one level up inside get_youtube_transcript
+    (@st.cache_data keyed on video_id + cookie_path), so creating a
+    lightweight API object per call has no meaningful performance cost.
     """
     if not YOUTUBE_AVAILABLE:
         return None
@@ -263,13 +282,17 @@ def get_youtube_api(cookie_path: str = None):
             pass
     return YouTubeTranscriptApi()
 
-def _scrape_youtube_transcript(video_id: str) -> str:
+def _scrape_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
     """
-    Multi-stage HTML scrape fallback when the transcript API is unavailable
-    or when a video is region-restricted / bot-blocked for the library.
+    Multi-stage HTML scrape fallback.
 
-    Stage 1 — Parse captionTracks from the raw YouTube watch-page HTML.
-              Optionally uses the uploaded cookies.txt for authenticated scrape.
+    cookie_path is passed as an explicit parameter (not read from
+    st.session_state) because this function may run inside a @st.cache_data
+    context where session state access is not reliable.
+
+    Stage 1 — Parse captionTracks from raw YouTube watch-page HTML.
+              When cookie_path is provided, loads it via MozillaCookieJar so
+              the HTTP session is authenticated — same bypass as the library.
     Stage 2 — Public proxy API (youtubetranscript.com).
     """
     headers = {
@@ -282,15 +305,11 @@ def _scrape_youtube_transcript(video_id: str) -> str:
 
     # ── Stage 1: parse captionTracks from page HTML ───────────────────────
     try:
-        # If the user uploaded cookies, load them into the request session so
-        # YouTube sees an authenticated user (same bypass as the library path).
         session = requests.Session()
         session.headers.update(headers)
         session.cookies.update(consent_cookies)
 
-        cookie_path = st.session_state.get("cookie_path")
         if cookie_path and os.path.exists(cookie_path):
-            import http.cookiejar
             cj = http.cookiejar.MozillaCookieJar()
             try:
                 cj.load(cookie_path, ignore_discard=True, ignore_expires=True)
@@ -298,7 +317,7 @@ def _scrape_youtube_transcript(video_id: str) -> str:
             except Exception:
                 pass  # malformed cookie file — proceed without
 
-        page_html  = session.get(
+        page_html = session.get(
             f"https://www.youtube.com/watch?v={video_id}", timeout=12
         ).text
         m = _RE_CAPTIONS.search(page_html)
@@ -336,13 +355,17 @@ def get_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
     """
     Primary transcript engine — results cached 1 hour per (video_id, cookie_path).
 
-    Plan A  youtube-transcript-api v1.x with optional cookie authentication.
-            Cookies make YouTube treat the request as a real logged-in browser,
-            bypassing bot-detection that causes 'currently blocking us' errors.
-    Plan B  HTML scrape with cookie injection (_scrape_youtube_transcript).
-    Plan C  Public proxy fallback inside the scrape function.
+    Keying on cookie_path means:
+      (video_id, None)        → unauthenticated cached result
+      (video_id, '/tmp/...')  → authenticated cached result
+    These are stored as separate cache entries, so uploading cookies always
+    triggers a fresh authenticated fetch instead of returning the old blocked result.
+
+    Plan A  youtube-transcript-api with a fresh cookie-aware instance
+    Plan B  HTML scrape with cookie injection via MozillaCookieJar
+    Plan C  Public proxy (inside scrape function as Stage 2)
     """
-    # ── Plan A: library (cookie-aware) ───────────────────────────────────
+    # ── Plan A: library ───────────────────────────────────────────────────
     if YOUTUBE_AVAILABLE:
         try:
             ytt             = get_youtube_api(cookie_path)
@@ -350,16 +373,15 @@ def get_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
             try:
                 transcript = transcript_list.find_transcript(['en'])
             except Exception:
-                # No English track — grab the first available and translate
                 transcript = next(iter(transcript_list))
             fetched   = transcript.fetch()
             formatter = YTTextFormatter()
             return formatter.format_transcript(fetched)
         except Exception:
-            pass  # fall through to scrape
+            pass
 
-    # ── Plan B/C: HTML scrape + proxy ────────────────────────────────────
-    return _scrape_youtube_transcript(video_id)
+    # ── Plan B/C: scrape + proxy ──────────────────────────────────────────
+    return _scrape_youtube_transcript(video_id, cookie_path)
 
 # ================================================
 # ANKI .APKG EXPORT ENGINE
@@ -592,10 +614,13 @@ with st.sidebar:
     st.divider()
 
     # ── YouTube Cookie Upload ─────────────────────────────────────────────
+    # Cookies bypass YouTube's bot-detection on transcript requests.
+    # Export cookies.txt (Netscape format) from your browser using an
+    # extension like "Get cookies.txt LOCALLY" or your Kiwi browser extension.
     st.subheader("🍪 YouTube Cookies")
     st.caption(
-        "Upload `cookies.txt` (Netscape format) exported from your browser "
-        "to bypass YouTube's bot-blocking on transcripts."
+        "Upload `cookies.txt` (Netscape format) to bypass YouTube's "
+        "bot-blocking on transcript extraction."
     )
     cookie_file = st.file_uploader(
         "cookies.txt", type=["txt"], key="yt_cookie_upload",
@@ -605,16 +630,15 @@ with st.sidebar:
         with open(_COOKIE_PATH, "wb") as fh:
             fh.write(cookie_file.getvalue())
         st.session_state["cookie_path"] = _COOKIE_PATH
-        # Invalidate cached transcript instances so next call uses new cookies
-        get_youtube_api.clear()
+        # Clear only the transcript cache — get_youtube_api is no longer
+        # cached, so there is no stale authenticated instance to worry about.
         get_youtube_transcript.clear()
-        st.success("✅ Cookies loaded — YouTube requests are now authenticated.")
+        st.success("✅ Cookies loaded — requests are now authenticated.")
     elif st.session_state.get("cookie_path") and os.path.exists(_COOKIE_PATH):
         st.success("✅ Cookies active (session)")
         if st.button("🗑️ Remove Cookies", key="remove_cookies"):
             os.remove(_COOKIE_PATH)
             st.session_state["cookie_path"] = None
-            get_youtube_api.clear()
             get_youtube_transcript.clear()
             st.rerun()
     else:
@@ -798,8 +822,8 @@ with tab_txt:
 with tab_yt:
     st.subheader("▶️ Generate Cards from a YouTube Video")
     st.caption(
-        "Paste any YouTube link below. The transcript will be extracted and fed directly "
-        "to the AI to generate flashcards — no copy-pasting needed."
+        "Paste any YouTube link below. The transcript is extracted automatically "
+        "and fed to the AI — no copy-pasting needed."
     )
 
     yt_url = st.text_input(
@@ -808,7 +832,6 @@ with tab_yt:
         key="yt_url_input"
     )
 
-    # Live video-ID preview so the user knows the URL was parsed correctly
     if yt_url:
         vid_id = extract_youtube_id(yt_url)
         if vid_id:
@@ -816,13 +839,12 @@ with tab_yt:
         else:
             st.warning("⚠️ Could not detect a valid YouTube video ID in that URL.")
 
-    # Cookie status inline hint
     if st.session_state.get("cookie_path") and os.path.exists(_COOKIE_PATH):
         st.success("🍪 Cookies active — authenticated requests will be used.")
     else:
         st.info(
-            "💡 **Tip:** If extraction fails with a bot-blocking error, upload your "
-            "`cookies.txt` in the sidebar under **YouTube Cookies**."
+            "💡 **Tip:** If extraction fails, upload your `cookies.txt` in the sidebar "
+            "under **YouTube Cookies** to authenticate and bypass bot-blocking."
         )
 
     col_fetch, col_gen = st.columns([1, 1])
@@ -842,14 +864,13 @@ with tab_yt:
         else:
             with st.spinner("Fetching transcript… (trying library → scrape → proxy)"):
                 try:
+                    # Read cookie_path here in the main UI context — safe to
+                    # access session_state outside of cached functions.
                     cookie_path = st.session_state.get("cookie_path")
                     transcript  = get_youtube_transcript(vid_id, cookie_path)
-                    # Store for the Generate step without re-fetching
                     st.session_state["yt_transcript"]  = transcript
                     st.session_state["yt_current_vid"] = vid_id
-                    st.success(
-                        f"✅ Transcript extracted! ({len(transcript):,} characters)"
-                    )
+                    st.success(f"✅ Transcript extracted! ({len(transcript):,} characters)")
                 except Exception as e:
                     st.session_state.pop("yt_transcript",  None)
                     st.session_state.pop("yt_current_vid", None)
@@ -859,7 +880,6 @@ with tab_yt:
                         "to authenticate requests and bypass bot-blocking."
                     )
 
-    # Editable transcript preview — always shown if a transcript is in state
     if "yt_transcript" in st.session_state:
         with st.expander("📄 Preview & Edit Transcript", expanded=True):
             edited_transcript = st.text_area(
@@ -869,7 +889,6 @@ with tab_yt:
                 key="yt_transcript_editor"
             )
 
-        # Chunk count & RPD check on the (possibly edited) transcript
         yt_chunks  = smart_chunk_text(edited_transcript)
         req_needed = len(yt_chunks)
         ok, preflight_msg = check_rpd_preflight(req_needed)
@@ -899,8 +918,12 @@ with tab_yt:
                     total_new = 0
                     for idx_c, chunk in enumerate(yt_chunks):
                         target_cards = min(40, max(5, len(chunk) // 300))
+                        # TRANSCRIPT_SUFFIX tells the model to ignore filler words,
+                        # reconstruct fragmented subtitle sentences, and collapse
+                        # repeated concepts — all common in raw subtitle input.
                         adaptive_sfx = (
                             prompt_suffix
+                            + TRANSCRIPT_SUFFIX
                             + f" Generate approximately {target_cards} diverse, atomic flashcards."
                         )
                         try:
@@ -923,7 +946,6 @@ with tab_yt:
                         label=f"✅ Done! {total_new} new cards added from YouTube transcript.",
                         state="complete"
                     )
-                # Clear cached transcript so next URL starts fresh
                 st.session_state.pop("yt_transcript",  None)
                 st.session_state.pop("yt_current_vid", None)
                 st.rerun()
