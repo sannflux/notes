@@ -48,7 +48,7 @@ if 'undo_stack'      not in st.session_state: st.session_state['undo_stack']    
 if 'card_filter'     not in st.session_state: st.session_state['card_filter']     = ""
 if 'cookie_path'     not in st.session_state: st.session_state['cookie_path']     = None
 
-# ── Persistent RPD Tracker ────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 TRACKER_FILE = "rpd_tracker.json"
 _COOKIE_PATH = "/tmp/yt_cookies.txt"
 
@@ -57,14 +57,20 @@ _RE_HTML_TAGS     = re.compile(r'<[^>]+>')
 _RE_WHITESPACE    = re.compile(r'\s+')
 _RE_CAPTIONS      = re.compile(r'"captionTracks"\s*:\s*(\[.*?\])')
 _RE_ACCESS_DENIED = re.compile(r'Access Denied|edgesuite\.net|Reference #')
-_RE_HTML_BLOCK    = re.compile(r'<HTML.*?>.*?</HTML>', re.IGNORECASE | re.DOTALL)
-_RE_IMG_TAG       = re.compile(r'!\[.*?\]\(.*?\)')
-_RE_LINK          = re.compile(r'\[([^\]]+)\]\([^\)]+\)')
-_RE_MULTILINE     = re.compile(r'\n\s*\n')
+
+# Strings that indicate the scrape returned an error page, not real captions.
+# If the cleaned text contains any of these, we reject it and move to next stage.
+_ERROR_SIGNATURES = [
+    "we're sorry",
+    "youtube is currently blocking",
+    "fetching subtitles",
+    "working on a fix",
+    "access denied",
+    "sign in to confirm",
+    "before you continue",
+]
 
 # ── Transcript-specific prompt suffix ────────────────────────────────────────
-# Applied only to YouTube transcript input to handle the unique noise
-# characteristics of raw subtitles: filler words, repetition, fragmentation.
 TRANSCRIPT_SUFFIX = (
     "\n\nINPUT TYPE: Raw video transcript/subtitles. "
     "IGNORE filler words ('um', 'uh', 'you know', 'like', 'right', 'okay', 'so'), "
@@ -98,7 +104,7 @@ def increment_rpd(calls=1):
 if 'rpd_used' not in st.session_state:
     st.session_state['rpd_used'] = load_rpd()
 
-# ── MathJax CDN + Full CSS Injection ─────────────────────────────────────────
+# ── MathJax CDN + Full CSS ────────────────────────────────────────────────────
 st.markdown("""
     <script>
     MathJax = {
@@ -116,13 +122,10 @@ st.markdown("""
 
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
-
     .anki-preview-container {
-        background-color: #272828; color: #e2e2e2;
-        border-radius: 12px; padding: 20px;
+        background-color: #272828; color: #e2e2e2; border-radius: 12px; padding: 20px;
         border: 2px solid #444; margin-bottom: 15px;
-        font-family: 'Inter', Arial, sans-serif;
-        text-align: center; font-size: 18px;
+        font-family: 'Inter', Arial, sans-serif; text-align: center; font-size: 18px;
     }
     .anki-preview-container hr   { border: 0; border-top: 1px solid #555; margin: 15px 0; }
     .anki-preview-answer         { color: #00aaff; font-weight: 600; }
@@ -131,20 +134,14 @@ st.markdown("""
     .anki-preview-mcq            { text-align: left; display: inline-block; margin: 10px auto;
                                    background: rgba(255,255,255,0.05); padding: 15px;
                                    border-radius: 8px; border: 1px solid #444; }
-    .anki-preview-meta           { font-size: 0.72em; text-align: right;
-                                   opacity: 0.6; margin-bottom: 6px; }
+    .anki-preview-meta           { font-size: 0.72em; text-align: right; opacity: 0.6; margin-bottom: 6px; }
     .conf-dot                    { display: inline-block; width: 10px; height: 10px;
                                    border-radius: 50%; margin-right: 5px; vertical-align: middle; }
-    .conf-high                   { background: #4caf50; }
-    .conf-med                    { background: #ff9800; }
-    .conf-low                    { background: #f44336; }
-    .tag-pill                    { background: rgba(0,170,255,0.2); color: #00aaff;
-                                   padding: 2px 10px; border-radius: 15px; font-size: 0.8em; }
-    .yt-cookie-box               { background: #1a1a2e; border: 1px solid #4a4a8a;
-                                   border-radius: 8px; padding: 10px; font-size: 12px;
-                                   color: #aaa; margin-top: 6px; }
-    table                        { width: 100%; border-collapse: collapse; margin-top: 10px; }
-    th, td                       { border: 1px solid #555; padding: 8px; text-align: left; }
+    .conf-high { background: #4caf50; } .conf-med { background: #ff9800; } .conf-low { background: #f44336; }
+    .yt-cookie-box               { background: #1a1a2e; border: 1px solid #4a4a8a; border-radius: 8px;
+                                   padding: 10px; font-size: 12px; color: #aaa; margin-top: 6px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border: 1px solid #555; padding: 8px; text-align: left; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -155,24 +152,21 @@ def enforce_api_delay():
     elapsed       = time.time() - st.session_state['last_api_call']
     required_wait = 13.0
     if elapsed < required_wait:
-        wait_time = required_wait - elapsed
-        with st.spinner(f"⏳ API Rate Limit Safeguard: Waiting {wait_time:.1f}s…"):
-            time.sleep(wait_time)
+        with st.spinner(f"⏳ Rate Limit Safeguard: Waiting {required_wait - elapsed:.1f}s…"):
+            time.sleep(required_wait - elapsed)
     st.session_state['last_api_call'] = time.time()
 
 def check_rpd_preflight(req_needed):
     remaining = 20 - st.session_state['rpd_used']
     if req_needed > remaining:
-        overage = req_needed - remaining
         return False, (
-            f"🚨 This batch needs **{req_needed}** requests but only **{remaining}** remain today "
-            f"(overage: {overage}). Reduce input size or wait until tomorrow."
+            f"🚨 This batch needs **{req_needed}** requests but only **{remaining}** remain today. "
+            f"Reduce input size or wait until tomorrow."
         )
     if remaining > 0 and req_needed / remaining >= 0.75:
-        pct = int(req_needed / remaining * 100)
         return True, (
-            f"⚠️ Warning: This will consume **{req_needed}/{remaining}** remaining requests "
-            f"({pct}% of your quota)."
+            f"⚠️ This will consume **{req_needed}/{remaining}** remaining requests "
+            f"({int(req_needed / remaining * 100)}% of your quota)."
         )
     return True, None
 
@@ -241,10 +235,6 @@ def get_confidence_tag(score):
 
 @functools.lru_cache(maxsize=64)
 def extract_youtube_id(url: str):
-    """
-    Extract 11-character video ID from any YouTube URL format.
-    LRU-cached — repeated calls with the same URL are instant.
-    """
     patterns = [
         r'(?:v=)([\w-]{11})',
         r'(?:youtu\.be/)([\w-]{11})',
@@ -259,18 +249,59 @@ def extract_youtube_id(url: str):
         return url.strip()
     return None
 
+def _is_error_content(text: str) -> bool:
+    """
+    Returns True if the scraped text is actually a YouTube error page
+    rather than real caption content.
+
+    This is the root cause of the 'We're sorry, YouTube is currently
+    blocking us...' text appearing in the transcript box: the scrape
+    successfully fetched a page, but that page was an error response.
+    YouTube strips HTML tags, leaving just the error message text, which
+    our code was incorrectly returning as a valid transcript.
+    """
+    lowered = text.lower()
+    return any(sig in lowered for sig in _ERROR_SIGNATURES)
+
+def _build_session_with_cookies(cookie_path: str = None) -> requests.Session:
+    """
+    Builds a requests.Session with a Chrome User-Agent, YouTube consent
+    cookie, and optionally the user-supplied Netscape cookies.txt.
+
+    Centralised here so both Stage 1 and Stage 2 of the scrape use
+    identical auth — previously they used different request methods so
+    only one stage could benefit from the uploaded cookies.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    session.cookies.set("CONSENT", "YES+cb.20210328-17-p0.en+FX+478")
+
+    if cookie_path and os.path.exists(cookie_path):
+        cj = http.cookiejar.MozillaCookieJar()
+        try:
+            cj.load(cookie_path, ignore_discard=True, ignore_expires=True)
+            session.cookies.update(cj)
+        except Exception:
+            pass  # malformed file — proceed unauthenticated
+
+    return session
+
 def get_youtube_api(cookie_path: str = None):
     """
     Returns a fresh YouTubeTranscriptApi instance on every call.
 
-    @st.cache_resource is intentionally NOT used here.  If it were, Streamlit
-    would cache the first unauthenticated instance and never replace it even
-    after the user uploads cookies, because the cached object lives in memory
-    regardless of the cookie_path argument changing.
-
-    Caching is handled one level up inside get_youtube_transcript
-    (@st.cache_data keyed on video_id + cookie_path), so creating a
-    lightweight API object per call has no meaningful performance cost.
+    @st.cache_resource is intentionally NOT used here.
+    If it were, Streamlit would permanently cache the first instance
+    (typically unauthenticated) and never replace it, even after the user
+    uploads cookies — because Streamlit's resource cache lives in process
+    memory for the app lifetime.  Since this is a cheap object to create,
+    we skip caching here and let @st.cache_data on get_youtube_transcript
+    handle the expensive work of actually fetching and storing transcripts.
     """
     if not YOUTUBE_AVAILABLE:
         return None
@@ -278,94 +309,74 @@ def get_youtube_api(cookie_path: str = None):
         try:
             return YouTubeTranscriptApi(cookies=cookie_path)
         except TypeError:
-            # Library build predates the cookies kwarg — fall back silently
-            pass
+            pass  # older library build without cookies kwarg
     return YouTubeTranscriptApi()
 
 def _scrape_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
     """
-    Multi-stage HTML scrape fallback.
+    Multi-stage HTML scrape fallback — ALL stages use the same authenticated
+    session built from cookie_path so cookies bypass bot-blocking at every level.
 
-    cookie_path is passed as an explicit parameter (not read from
-    st.session_state) because this function may run inside a @st.cache_data
-    context where session state access is not reliable.
+    Previously cookie_path was only used in Plan A (the library).
+    When Plan A failed and fell through to the scrape, the scrape ran
+    unauthenticated, YouTube returned an error HTML page, and the error
+    message text was returned as the 'transcript'.  This function fixes that
+    by (a) passing cookies through the session and (b) rejecting any result
+    that looks like an error page via _is_error_content().
 
     Stage 1 — Parse captionTracks from raw YouTube watch-page HTML.
-              When cookie_path is provided, loads it via MozillaCookieJar so
-              the HTTP session is authenticated — same bypass as the library.
-    Stage 2 — Public proxy API (youtubetranscript.com).
+    Stage 2 — Public proxy (youtubetranscript.com).
     """
-    headers = {
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    consent_cookies = {"CONSENT": "YES+cb.20210328-17-p0.en+FX+478"}
+    session = _build_session_with_cookies(cookie_path)
 
-    # ── Stage 1: parse captionTracks from page HTML ───────────────────────
+    # ── Stage 1 ───────────────────────────────────────────────────────────
     try:
-        session = requests.Session()
-        session.headers.update(headers)
-        session.cookies.update(consent_cookies)
-
-        if cookie_path and os.path.exists(cookie_path):
-            cj = http.cookiejar.MozillaCookieJar()
-            try:
-                cj.load(cookie_path, ignore_discard=True, ignore_expires=True)
-                session.cookies.update(cj)
-            except Exception:
-                pass  # malformed cookie file — proceed without
-
         page_html = session.get(
             f"https://www.youtube.com/watch?v={video_id}", timeout=12
         ).text
-        m = _RE_CAPTIONS.search(page_html)
+        m = re.search(r'"captionTracks"\s*:\s*(\[.*?\])', page_html)
         if m:
-            xml_url    = json.loads(m.group(1))[0]['baseUrl']
-            xml_resp   = session.get(xml_url, timeout=10)
-            transcript = _RE_HTML_TAGS.sub(' ', xml_resp.text)
-            transcript = html_lib.unescape(transcript)
-            result     = _RE_WHITESPACE.sub(' ', transcript).strip()
-            if result:
-                return result
+            xml_url  = json.loads(m.group(1))[0]['baseUrl']
+            xml_resp = session.get(xml_url, timeout=10)
+            cleaned  = _RE_HTML_TAGS.sub(' ', xml_resp.text)
+            cleaned  = html_lib.unescape(cleaned)
+            cleaned  = _RE_WHITESPACE.sub(' ', cleaned).strip()
+            if cleaned and not _is_error_content(cleaned):
+                return cleaned
     except Exception:
         pass
 
     # ── Stage 2: public proxy ─────────────────────────────────────────────
     try:
-        proxy = requests.get(
+        proxy   = session.get(
             f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=12
         )
-        if '<transcript>' in proxy.text or '<?xml' in proxy.text:
-            transcript = _RE_HTML_TAGS.sub(' ', proxy.text)
-            transcript = html_lib.unescape(transcript)
-            return _RE_WHITESPACE.sub(' ', transcript).strip()
+        cleaned = _RE_HTML_TAGS.sub(' ', proxy.text)
+        cleaned = html_lib.unescape(cleaned)
+        cleaned = _RE_WHITESPACE.sub(' ', cleaned).strip()
+        if ('<transcript>' in proxy.text or '<?xml' in proxy.text) and not _is_error_content(cleaned):
+            return cleaned
     except Exception:
         pass
 
     raise ValueError(
         "All extraction methods failed. "
         "The video may have no closed captions, or YouTube is blocking requests. "
-        "Try uploading your YouTube cookies.txt in the sidebar."
+        "Upload your YouTube cookies.txt in the sidebar to authenticate requests."
     )
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
     """
-    Primary transcript engine — results cached 1 hour per (video_id, cookie_path).
+    Primary transcript engine — cached 1 hour per (video_id, cookie_path).
 
-    Keying on cookie_path means:
-      (video_id, None)        → unauthenticated cached result
-      (video_id, '/tmp/...')  → authenticated cached result
-    These are stored as separate cache entries, so uploading cookies always
-    triggers a fresh authenticated fetch instead of returning the old blocked result.
+    Keying on cookie_path means (video_id, None) and (video_id, '/tmp/...')
+    are separate cache entries.  Uploading cookies clears the old unauthenticated
+    result and forces a fresh authenticated fetch.
 
-    Plan A  youtube-transcript-api with a fresh cookie-aware instance
-    Plan B  HTML scrape with cookie injection via MozillaCookieJar
-    Plan C  Public proxy (inside scrape function as Stage 2)
+    Plan A  youtube-transcript-api library with fresh cookie-aware instance
+    Plan B  HTML scrape with MozillaCookieJar authentication (Stage 1 + 2)
     """
-    # ── Plan A: library ───────────────────────────────────────────────────
     if YOUTUBE_AVAILABLE:
         try:
             ytt             = get_youtube_api(cookie_path)
@@ -380,7 +391,6 @@ def get_youtube_transcript(video_id: str, cookie_path: str = None) -> str:
         except Exception:
             pass
 
-    # ── Plan B/C: scrape + proxy ──────────────────────────────────────────
     return _scrape_youtube_transcript(video_id, cookie_path)
 
 # ================================================
@@ -398,8 +408,7 @@ ANKI_CSS = """
                border: 1px solid #ccc; border-radius: 8px; background-color: #fafafa; }
 .card.nightMode .mcq-options { background-color: #333; border: 1px solid #555; }
 .mcq-answer { color: #00aaff; font-weight: bold; }
-.conf-dot { display:inline-block; width:9px; height:9px; border-radius:50%;
-            margin-right:5px; vertical-align:middle; }
+.conf-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
 .conf-high { background:#4caf50; } .conf-med { background:#ff9800; } .conf-low { background:#f44336; }
 table { width: 100%; border-collapse: collapse; margin-top: 10px; }
 th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
@@ -412,46 +421,28 @@ MCQ_MODEL_ID   = 1607392321
 
 anki_basic_model = genanki.Model(
     BASIC_MODEL_ID, 'AI Anki PRO',
-    fields=[
-        {'name': 'Question'}, {'name': 'Answer'},
-        {'name': 'Context'},  {'name': 'Audio'}, {'name': 'Confidence'}
-    ],
-    templates=[{
-        'name': 'Card 1',
+    fields=[{'name': 'Question'}, {'name': 'Answer'}, {'name': 'Context'}, {'name': 'Audio'}, {'name': 'Confidence'}],
+    templates=[{'name': 'Card 1',
         'qfmt': '{{Question}}',
-        'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}<br><br>{{Audio}}'
-                '<div class="context">{{Context}}</div>'
-    }],
+        'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'}],
     css=ANKI_CSS
 )
-
 anki_cloze_model = genanki.Model(
     CLOZE_MODEL_ID, 'AI Anki Cloze', model_type=genanki.Model.CLOZE,
-    fields=[
-        {'name': 'Text'}, {'name': 'Context'},
-        {'name': 'Audio'}, {'name': 'Confidence'}
-    ],
-    templates=[{
-        'name': 'Cloze',
+    fields=[{'name': 'Text'}, {'name': 'Context'}, {'name': 'Audio'}, {'name': 'Confidence'}],
+    templates=[{'name': 'Cloze',
         'qfmt': '{{cloze:Text}}',
-        'afmt': '{{cloze:Text}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'
-    }],
+        'afmt': '{{cloze:Text}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'}],
     css=ANKI_CSS
 )
-
 anki_mcq_model = genanki.Model(
     MCQ_MODEL_ID, 'AI Anki MCQ',
-    fields=[
-        {'name': 'Question'}, {'name': 'Options'}, {'name': 'Answer'},
-        {'name': 'Context'},  {'name': 'Audio'},   {'name': 'Confidence'}
-    ],
-    templates=[{
-        'name': 'MCQ Card',
+    fields=[{'name': 'Question'}, {'name': 'Options'}, {'name': 'Answer'}, {'name': 'Context'}, {'name': 'Audio'}, {'name': 'Confidence'}],
+    templates=[{'name': 'MCQ Card',
         'qfmt': '{{Question}}<br><br><div class="mcq-options">{{Options}}</div>',
         'afmt': '{{Question}}<br><br><div class="mcq-options">{{Options}}</div>'
                 '<hr id="answer"><span class="mcq-answer">{{Answer}}</span>'
-                '<br><br>{{Audio}}<div class="context">{{Context}}</div>'
-    }],
+                '<br><br>{{Audio}}<div class="context">{{Context}}</div>'}],
     css=ANKI_CSS
 )
 
@@ -466,8 +457,7 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
             if include_audio:
                 try:
                     text_to_read = c['Answer'] if c.get('Answer') else c['Question']
-                    clean_text   = re.sub(r'<[^>]+>', '', str(text_to_read))
-                    clean_text   = re.sub(r'\\\[|\\\]|\\\(|\\\)', '', clean_text).strip()
+                    clean_text   = re.sub(r'<[^>]+>|\\\[|\\\]|\\\(|\\\)', '', str(text_to_read)).strip()
                     if clean_text:
                         cache_key = hash(clean_text + lang_code)
                         filename  = f"audio_{cache_key}.mp3"
@@ -492,25 +482,16 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
                 tags.append(conf_tag)
 
             if c.get('Options'):
-                note = genanki.Note(
-                    model=anki_mcq_model,
+                note = genanki.Note(model=anki_mcq_model,
                     fields=[str(c['Question']), str(c['Options']), str(c['Answer']),
-                            str(c['Context']), audio_field, conf_str],
-                    tags=tags
-                )
+                            str(c['Context']), audio_field, conf_str], tags=tags)
             elif "{{c" in str(c['Question']):
-                note = genanki.Note(
-                    model=anki_cloze_model,
-                    fields=[str(c['Question']), str(c['Context']), audio_field, conf_str],
-                    tags=tags
-                )
+                note = genanki.Note(model=anki_cloze_model,
+                    fields=[str(c['Question']), str(c['Context']), audio_field, conf_str], tags=tags)
             else:
-                note = genanki.Note(
-                    model=anki_basic_model,
+                note = genanki.Note(model=anki_basic_model,
                     fields=[str(c['Question']), str(c['Answer']),
-                            str(c['Context']), audio_field, conf_str],
-                    tags=tags
-                )
+                            str(c['Context']), audio_field, conf_str], tags=tags)
             deck.add_note(note)
 
         package             = genanki.Package(deck)
@@ -553,26 +534,19 @@ def extract_partial_json(text_response):
             pass
     return cards
 
-@retry(
-    wait=wait_exponential(multiplier=2, min=15, max=60),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception_type(Exception),
-    reraise=True
-)
+@retry(wait=wait_exponential(multiplier=2, min=15, max=60),
+       stop=stop_after_attempt(3),
+       retry=retry_if_exception_type(Exception),
+       reraise=True)
 def _call_gemini(model, content):
     return model.generate_content(content)
 
 def process_super_batch(payloads, model, prompt_suffix, is_image=True):
     enforce_api_delay()
-    full_prompt = (
-        f"{prompt_suffix}\n"
-        f"Extract flashcards from ALL provided {'images' if is_image else 'text'}."
-    )
-    content = payloads + [full_prompt] if is_image else [full_prompt, payloads]
-
-    response   = _call_gemini(model, content)
-    clean_json = re.sub(r'```json|```', '', response.text).strip()
-
+    full_prompt = f"{prompt_suffix}\nExtract flashcards from ALL provided {'images' if is_image else 'text'}."
+    content     = payloads + [full_prompt] if is_image else [full_prompt, payloads]
+    response    = _call_gemini(model, content)
+    clean_json  = re.sub(r'```json|```', '', response.text).strip()
     try:
         return json.loads(clean_json)
     except json.JSONDecodeError:
@@ -606,34 +580,31 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🎯 Quality Filter")
-    min_confidence = st.slider(
-        "Min. Confidence Score", min_value=0, max_value=100, value=0, step=5,
-        help="Cards below this threshold are hidden from preview AND excluded from export."
-    )
+    min_confidence = st.slider("Min. Confidence Score", 0, 100, 0, 5,
+        help="Cards below this threshold are hidden from preview AND excluded from export.")
 
     st.divider()
 
     # ── YouTube Cookie Upload ─────────────────────────────────────────────
-    # Cookies bypass YouTube's bot-detection on transcript requests.
-    # Export cookies.txt (Netscape format) from your browser using an
-    # extension like "Get cookies.txt LOCALLY" or your Kiwi browser extension.
     st.subheader("🍪 YouTube Cookies")
     st.caption(
-        "Upload `cookies.txt` (Netscape format) to bypass YouTube's "
-        "bot-blocking on transcript extraction."
+        "Upload `cookies.txt` (Netscape format) exported from your browser. "
+        "Cookies are passed to **every** stage of transcript extraction — "
+        "the library, the page scrape, and the XML fetch — so YouTube sees "
+        "an authenticated request at all levels."
     )
-    cookie_file = st.file_uploader(
-        "cookies.txt", type=["txt"], key="yt_cookie_upload",
-        label_visibility="collapsed"
-    )
+    cookie_file = st.file_uploader("cookies.txt", type=["txt"],
+                                   key="yt_cookie_upload", label_visibility="collapsed")
+
     if cookie_file is not None:
         with open(_COOKIE_PATH, "wb") as fh:
             fh.write(cookie_file.getvalue())
         st.session_state["cookie_path"] = _COOKIE_PATH
-        # Clear only the transcript cache — get_youtube_api is no longer
-        # cached, so there is no stale authenticated instance to worry about.
+        # Clear transcript cache so the next request is a fresh authenticated
+        # fetch rather than returning a previously cached unauthenticated result.
         get_youtube_transcript.clear()
-        st.success("✅ Cookies loaded — requests are now authenticated.")
+        st.success("✅ Cookies loaded — all extraction stages are now authenticated.")
+
     elif st.session_state.get("cookie_path") and os.path.exists(_COOKIE_PATH):
         st.success("✅ Cookies active (session)")
         if st.button("🗑️ Remove Cookies", key="remove_cookies"):
@@ -651,9 +622,7 @@ with st.sidebar:
     st.subheader("📊 API Quota Tracker")
     rpd_val = st.session_state['rpd_used']
     st.progress(min(rpd_val / 20.0, 1.0))
-    remaining_rpd = max(0, 20 - rpd_val)
-    st.markdown(f"**Used:** {rpd_val} / 20 &nbsp;|&nbsp; **Remaining:** {remaining_rpd}")
-
+    st.markdown(f"**Used:** {rpd_val} / 20 &nbsp;|&nbsp; **Remaining:** {max(0, 20 - rpd_val)}")
     quota_reached = (rpd_val >= 20)
     if quota_reached:
         st.error("🚨 Daily Limit Reached. App is in Read-Only mode.")
@@ -691,13 +660,12 @@ instruction = BASE_SYSTEM_INSTRUCTION
 if cloze_mode:
     instruction += (
         "\nCLOZE MODE: 'question' must contain {{c1::...}}. "
-        "Occlude ONLY the highest-yield noun/concept "
-        "(e.g., 'The mitochondria is the {{c1::powerhouse}}', not '{{c1::mitochondria}}')."
+        "Occlude ONLY the highest-yield noun/concept."
     )
 if mcq_mode:
     instruction += (
         "\nMULTIPLE CHOICE MODE: Provide exactly 3 realistic wrong answers in 'distractors'. "
-        "Distractors must be contextually similar to the correct answer to prevent obvious guessing."
+        "Distractors must be contextually similar to the correct answer."
     )
 if language == "Bilingual":
     instruction += (
@@ -715,14 +683,8 @@ if api_key:
     )
 
 prompt_suffix = f"Subject: {subject}. Language: {language}."
+tab_img, tab_txt, tab_yt = st.tabs(["📸 Image Super-Batch", "📝 Text / Notes", "▶️ YouTube URL"])
 
-tab_img, tab_txt, tab_yt = st.tabs([
-    "📸 Image Super-Batch",
-    "📝 Text / Notes",
-    "▶️ YouTube URL"
-])
-
-# ── Helper: card appender (shared by all tabs) ────────────────────────────────
 def append_cards_from_response(cards):
     for card in cards:
         new_q    = card.get('question', '')
@@ -730,9 +692,8 @@ def append_cards_from_response(cards):
         if mcq_mode and card.get('distractors'):
             options = [card.get('answer')] + card.get('distractors')
             random.shuffle(options)
-            letters = ['A', 'B', 'C', 'D', 'E']
             for j, opt in enumerate(options[:4]):
-                mcq_html += f"<b>{letters[j]})</b> {opt}<br>"
+                mcq_html += f"<b>{'ABCD'[j]})</b> {opt}<br>"
         if not is_duplicate(new_q, st.session_state['generated_cards']):
             st.session_state['generated_cards'].append({
                 "Question":   markdown_to_html(new_q),
@@ -747,12 +708,8 @@ def append_cards_from_response(cards):
 # TAB 1 — IMAGE SUPER-BATCH
 # ================================================
 with tab_img:
-    uploaded_files = st.file_uploader(
-        "Upload Images (Groups of 10 max)",
-        type=['png', 'jpg', 'jpeg'],
-        accept_multiple_files=True
-    )
-
+    uploaded_files = st.file_uploader("Upload Images (Groups of 10 max)",
+                                      type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
     if uploaded_files:
         with st.expander("🖼️ Preview Uploaded Images"):
             cols = st.columns(5)
@@ -762,21 +719,19 @@ with tab_img:
         if api_key:
             req_needed = max(1, (len(uploaded_files) + 9) // 10)
             ok, preflight_msg = check_rpd_preflight(req_needed)
-            if preflight_msg:
-                (st.warning if ok else st.error)(preflight_msg)
+            if preflight_msg: (st.warning if ok else st.error)(preflight_msg)
             st.info(f"ℹ️ {len(uploaded_files)} image(s) → **{req_needed} API Request(s)**.")
 
-            if st.button("🚀 Generate from Images", type="primary",
-                         disabled=(quota_reached or not ok)):
+            if st.button("🚀 Generate from Images", type="primary", disabled=(quota_reached or not ok)):
                 push_undo(st.session_state['generated_cards'])
-                with st.status(f"Processing {req_needed} super-batch request(s)…", expanded=True) as status:
+                with st.status(f"Processing {req_needed} batch(es)…", expanded=True) as status:
                     for i in range(0, len(uploaded_files), 10):
-                        chunk          = uploaded_files[i:i + 10]
-                        processed_imgs = [enhance_image(Image.open(f)) for f in chunk]
-                        target_cards   = min(30, len(chunk) * 5)
-                        adaptive_sfx   = prompt_suffix + f" Generate approximately {target_cards} diverse, atomic flashcards."
+                        chunk         = uploaded_files[i:i + 10]
+                        target_cards  = min(30, len(chunk) * 5)
+                        adaptive_sfx  = prompt_suffix + f" Generate approximately {target_cards} diverse, atomic flashcards."
                         try:
-                            cards = process_super_batch(processed_imgs, model, adaptive_sfx, is_image=True)
+                            cards = process_super_batch([enhance_image(Image.open(f)) for f in chunk],
+                                                        model, adaptive_sfx, is_image=True)
                             st.session_state['rpd_used'] = increment_rpd(1)
                             append_cards_from_response(cards)
                             st.write(f"✅ Batch {i//10 + 1}: {len(cards)} cards generated.")
@@ -786,26 +741,23 @@ with tab_img:
                 st.rerun()
 
 # ================================================
-# TAB 2 — TEXT / NOTES SUPER-BATCH
+# TAB 2 — TEXT / NOTES
 # ================================================
 with tab_txt:
     pasted_text = st.text_area("Paste Lecture Notes, Transcripts, or PDF Text:", height=200)
-
     if pasted_text and api_key:
         text_chunks = smart_chunk_text(pasted_text)
         req_needed  = len(text_chunks)
         ok, preflight_msg = check_rpd_preflight(req_needed)
-        if preflight_msg:
-            (st.warning if ok else st.error)(preflight_msg)
-        st.info(f"ℹ️ {len(pasted_text):,} characters → **{req_needed} chunk(s)** → **{req_needed} API Request(s)**.")
+        if preflight_msg: (st.warning if ok else st.error)(preflight_msg)
+        st.info(f"ℹ️ {len(pasted_text):,} chars → **{req_needed} chunk(s)** → **{req_needed} API Request(s)**.")
 
-        if st.button("🚀 Generate from Text", type="primary",
-                     disabled=(quota_reached or not ok)):
+        if st.button("🚀 Generate from Text", type="primary", disabled=(quota_reached or not ok)):
             push_undo(st.session_state['generated_cards'])
             with st.status("Processing text chunks…", expanded=True) as status:
                 for idx_c, chunk in enumerate(text_chunks):
                     target_cards = min(40, max(5, len(chunk) // 300))
-                    adaptive_sfx  = prompt_suffix + f" Generate approximately {target_cards} diverse, atomic flashcards."
+                    adaptive_sfx = prompt_suffix + f" Generate approximately {target_cards} diverse, atomic flashcards."
                     try:
                         cards = process_super_batch(chunk, model, adaptive_sfx, is_image=False)
                         st.session_state['rpd_used'] = increment_rpd(1)
@@ -821,51 +773,32 @@ with tab_txt:
 # ================================================
 with tab_yt:
     st.subheader("▶️ Generate Cards from a YouTube Video")
-    st.caption(
-        "Paste any YouTube link below. The transcript is extracted automatically "
-        "and fed to the AI — no copy-pasting needed."
-    )
+    st.caption("Paste any YouTube link. The transcript is extracted automatically and fed to the AI.")
 
-    yt_url = st.text_input(
-        "YouTube URL",
-        placeholder="https://www.youtube.com/watch?v=...",
-        key="yt_url_input"
-    )
+    yt_url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...", key="yt_url_input")
 
     if yt_url:
         vid_id = extract_youtube_id(yt_url)
-        if vid_id:
-            st.caption(f"🎬 Detected video ID: `{vid_id}`")
-        else:
-            st.warning("⚠️ Could not detect a valid YouTube video ID in that URL.")
+        if vid_id: st.caption(f"🎬 Detected video ID: `{vid_id}`")
+        else:      st.warning("⚠️ Could not detect a valid YouTube video ID in that URL.")
 
     if st.session_state.get("cookie_path") and os.path.exists(_COOKIE_PATH):
-        st.success("🍪 Cookies active — authenticated requests will be used.")
+        st.success("🍪 Cookies active — authenticated requests will be used at every extraction stage.")
     else:
-        st.info(
-            "💡 **Tip:** If extraction fails, upload your `cookies.txt` in the sidebar "
-            "under **YouTube Cookies** to authenticate and bypass bot-blocking."
-        )
+        st.info("💡 **Tip:** Upload `cookies.txt` in the sidebar to bypass YouTube bot-blocking.")
 
-    col_fetch, col_gen = st.columns([1, 1])
-
+    col_fetch, col_gen = st.columns(2)
     with col_fetch:
-        fetch_btn = st.button(
-            "📥 Extract Transcript",
-            type="secondary",
-            disabled=(not yt_url),
-            use_container_width=True
-        )
+        fetch_btn = st.button("📥 Extract Transcript", type="secondary",
+                              disabled=(not yt_url), use_container_width=True)
 
     if fetch_btn and yt_url:
         vid_id = extract_youtube_id(yt_url)
         if not vid_id:
             st.error("Invalid YouTube URL — could not parse a video ID.")
         else:
-            with st.spinner("Fetching transcript… (trying library → scrape → proxy)"):
+            with st.spinner("Fetching transcript… (library → authenticated scrape → proxy)"):
                 try:
-                    # Read cookie_path here in the main UI context — safe to
-                    # access session_state outside of cached functions.
                     cookie_path = st.session_state.get("cookie_path")
                     transcript  = get_youtube_transcript(vid_id, cookie_path)
                     st.session_state["yt_transcript"]  = transcript
@@ -875,77 +808,51 @@ with tab_yt:
                     st.session_state.pop("yt_transcript",  None)
                     st.session_state.pop("yt_current_vid", None)
                     st.error(f"Transcript extraction failed: {e}")
-                    st.info(
-                        "**What to try:** Upload your YouTube `cookies.txt` in the sidebar "
-                        "to authenticate requests and bypass bot-blocking."
-                    )
+                    st.info("Upload your `cookies.txt` in the sidebar to authenticate and bypass blocking.")
 
     if "yt_transcript" in st.session_state:
         with st.expander("📄 Preview & Edit Transcript", expanded=True):
             edited_transcript = st.text_area(
-                "You can clean up or trim the transcript before generating cards:",
+                "Clean up or trim the transcript before generating cards:",
                 value=st.session_state["yt_transcript"],
-                height=250,
-                key="yt_transcript_editor"
+                height=250, key="yt_transcript_editor"
             )
 
         yt_chunks  = smart_chunk_text(edited_transcript)
         req_needed = len(yt_chunks)
         ok, preflight_msg = check_rpd_preflight(req_needed)
-        if preflight_msg:
-            (st.warning if ok else st.error)(preflight_msg)
-        st.info(
-            f"ℹ️ {len(edited_transcript):,} characters → "
-            f"**{req_needed} chunk(s)** → **{req_needed} API Request(s)**."
-        )
+        if preflight_msg: (st.warning if ok else st.error)(preflight_msg)
+        st.info(f"ℹ️ {len(edited_transcript):,} chars → **{req_needed} chunk(s)** → **{req_needed} API Request(s)**.")
 
         with col_gen:
-            gen_btn = st.button(
-                "🚀 Generate Cards from Transcript",
-                type="primary",
-                disabled=(quota_reached or not ok or not api_key),
-                use_container_width=True
-            )
+            gen_btn = st.button("🚀 Generate Cards from Transcript", type="primary",
+                                disabled=(quota_reached or not ok or not api_key),
+                                use_container_width=True)
 
         if gen_btn:
             if not api_key:
                 st.error("Gemini API key required — enter it in the sidebar.")
             else:
                 push_undo(st.session_state['generated_cards'])
-                with st.status(
-                    f"Processing {req_needed} transcript chunk(s)…", expanded=True
-                ) as status:
+                with st.status(f"Processing {req_needed} chunk(s)…", expanded=True) as status:
                     total_new = 0
                     for idx_c, chunk in enumerate(yt_chunks):
                         target_cards = min(40, max(5, len(chunk) // 300))
-                        # TRANSCRIPT_SUFFIX tells the model to ignore filler words,
-                        # reconstruct fragmented subtitle sentences, and collapse
-                        # repeated concepts — all common in raw subtitle input.
                         adaptive_sfx = (
-                            prompt_suffix
-                            + TRANSCRIPT_SUFFIX
+                            prompt_suffix + TRANSCRIPT_SUFFIX
                             + f" Generate approximately {target_cards} diverse, atomic flashcards."
                         )
                         try:
-                            cards = process_super_batch(
-                                chunk, model, adaptive_sfx, is_image=False
-                            )
+                            cards  = process_super_batch(chunk, model, adaptive_sfx, is_image=False)
                             st.session_state['rpd_used'] = increment_rpd(1)
                             before = len(st.session_state['generated_cards'])
                             append_cards_from_response(cards)
                             added      = len(st.session_state['generated_cards']) - before
                             total_new += added
-                            st.write(
-                                f"✅ Chunk {idx_c + 1}/{req_needed}: "
-                                f"{len(cards)} generated, {added} added (dupes skipped)."
-                            )
+                            st.write(f"✅ Chunk {idx_c + 1}/{req_needed}: {len(cards)} generated, {added} added.")
                         except Exception as e:
                             st.error(f"Chunk {idx_c + 1} Error: {e}")
-
-                    status.update(
-                        label=f"✅ Done! {total_new} new cards added from YouTube transcript.",
-                        state="complete"
-                    )
+                    status.update(label=f"✅ Done! {total_new} new cards added.", state="complete")
                 st.session_state.pop("yt_transcript",  None)
                 st.session_state.pop("yt_current_vid", None)
                 st.rerun()
@@ -955,7 +862,6 @@ with tab_yt:
 # ================================================
 if st.session_state['generated_cards']:
     st.divider()
-
     all_cards = st.session_state['generated_cards']
 
     undo_col, _ = st.columns([1, 5])
@@ -984,19 +890,15 @@ if st.session_state['generated_cards']:
     s4.metric("Avg. Confidence", f"{avg_conf}%")
     s5.metric("Unique Tags",     len(all_tags))
 
-    filter_query = st.text_input(
-        "🔍 Filter cards by keyword (searches question, answer, and tags):",
-        value=st.session_state['card_filter']
-    )
+    filter_query = st.text_input("🔍 Filter cards by keyword:",
+                                 value=st.session_state['card_filter'])
     st.session_state['card_filter'] = filter_query
     if filter_query:
         fq = filter_query.lower()
-        filtered_indexed = [
-            (i, c) for i, c in filtered_indexed
-            if fq in str(c.get('Question', '')).lower()
-            or fq in str(c.get('Answer',   '')).lower()
-            or fq in str(c.get('Tags',     '')).lower()
-        ]
+        filtered_indexed = [(i, c) for i, c in filtered_indexed
+                            if fq in str(c.get('Question', '')).lower()
+                            or fq in str(c.get('Answer',   '')).lower()
+                            or fq in str(c.get('Tags',     '')).lower()]
         st.caption(f"Showing {len(filtered_indexed)} card(s) matching '{filter_query}'.")
 
     filtered_cards = [c for _, c in filtered_indexed]
@@ -1006,60 +908,49 @@ if st.session_state['generated_cards']:
     st.session_state['generated_cards'] = edited_df.fillna("").to_dict('records')
 
     with st.expander("🏷️ Bulk Tag Manager"):
-        b_col1, b_col2, b_col3 = st.columns(3)
-        bulk_tag = b_col1.text_input("Tag (e.g., #Exam1):").replace(" ", "_")
-        if b_col2.button("➕ Add to All") and bulk_tag:
+        b1, b2, b3 = st.columns(3)
+        bulk_tag   = b1.text_input("Tag (e.g., #Exam1):").replace(" ", "_")
+        if b2.button("➕ Add to All") and bulk_tag:
             for c in st.session_state['generated_cards']:
-                if bulk_tag not in c['Tags']:
-                    c['Tags'] += f" {bulk_tag}"
+                if bulk_tag not in c['Tags']: c['Tags'] += f" {bulk_tag}"
             st.rerun()
-        if b_col3.button("➖ Remove from All") and bulk_tag:
+        if b3.button("➖ Remove from All") and bulk_tag:
             for c in st.session_state['generated_cards']:
                 c['Tags'] = c['Tags'].replace(bulk_tag, "").strip()
             st.rerun()
 
     st.subheader("👀 Night Mode Card Preview")
-    total_visible = len(filtered_cards)
-    if total_visible == 0:
+    if not filtered_cards:
         st.info("No cards match current filter / confidence threshold.")
     else:
-        max_page = max(1, (total_visible + 4) // 5)
-        page = st.number_input("Preview Page", min_value=1, max_value=max_page, step=1) - 1
+        max_page = max(1, (len(filtered_cards) + 4) // 5)
+        page     = st.number_input("Preview Page", min_value=1, max_value=max_page, step=1) - 1
 
         for slot, (real_idx, c) in enumerate(filtered_indexed[page*5 : page*5 + 5]):
             conf_dot  = get_confidence_dot(c.get('Confidence', 0))
-            mcq_block = (
-                f"<div class='anki-preview-mcq'>{c.get('Options', '')}</div>"
-                if c.get('Options') else ""
-            )
+            mcq_block = (f"<div class='anki-preview-mcq'>{c.get('Options', '')}</div>"
+                         if c.get('Options') else "")
             st.markdown(f"""
                 <div class="anki-preview-container">
-                    <div class="anki-preview-meta">
-                        {conf_dot} Confidence: {c.get('Confidence', 'N/A')}
-                    </div>
-                    <div>{c['Question']}</div>
-                    {mcq_block}
-                    <hr>
+                    <div class="anki-preview-meta">{conf_dot} Confidence: {c.get('Confidence', 'N/A')}</div>
+                    <div>{c['Question']}</div>{mcq_block}<hr>
                     <div class="anki-preview-answer">{c['Answer']}</div>
                     <div class="anki-preview-context">{c['Context']}</div>
-                </div>
-            """, unsafe_allow_html=True)
+                </div>""", unsafe_allow_html=True)
 
-            p_col1, p_col2 = st.columns([1, 4])
-            with p_col1:
+            p1, p2 = st.columns([1, 4])
+            with p1:
                 if st.button("🔊 Listen", key=f"tts_{real_idx}_{slot}"):
                     clean_ans = re.sub(r'<[^>]+>|\\\[|\\\]|\\\(|\\\)', '', str(c['Answer']))
                     tts_obj   = gTTS(clean_ans, lang=current_lang_code)
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-                        tts_obj.save(fp.name)
-                        st.audio(fp.name)
-            with p_col2:
+                        tts_obj.save(fp.name); st.audio(fp.name)
+            with p2:
                 if st.button("🗑️ Delete Card", key=f"del_{real_idx}_{slot}"):
                     st.session_state['generated_cards'].pop(real_idx)
                     st.session_state['apkg_cache'] = None
                     st.rerun()
 
-    # ── Export ────────────────────────────────────────────────────────────
     st.divider()
     col1, col2, col3 = st.columns(3)
 
@@ -1080,33 +971,20 @@ if st.session_state['generated_cards']:
                     st.rerun()
         else:
             st.success("✅ Compilation complete!")
-            st.download_button(
-                "💾 Download .apkg",
-                st.session_state['apkg_cache'],
+            st.download_button("💾 Download .apkg", st.session_state['apkg_cache'],
                 file_name=f"{subject.replace('::', '_')}.apkg",
-                mime="application/octet-stream",
-                use_container_width=True
-            )
+                mime="application/octet-stream", use_container_width=True)
 
     with col2:
         st.subheader("📄 CSV Backup")
-        csv_data = df.to_csv(index=False)
-        st.download_button(
-            "📥 Download CSV",
-            csv_data,
+        st.download_button("📥 Download CSV", df.to_csv(index=False),
             file_name=f"{subject.replace('::', '_')}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+            mime="text/csv", use_container_width=True)
 
     with col3:
         st.subheader("💾 Save Session")
         session_json = json.dumps(st.session_state['generated_cards'], indent=2, ensure_ascii=False)
-        st.download_button(
-            "📤 Export Session (.json)",
-            session_json,
+        st.download_button("📤 Export Session (.json)", session_json,
             file_name=f"{subject.replace('::', '_')}_session.json",
-            mime="application/json",
-            use_container_width=True
-        )
+            mime="application/json", use_container_width=True)
         st.caption("Reload this file via the sidebar to resume your session later.")
