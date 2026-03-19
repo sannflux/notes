@@ -5,3 +5,5 @@ pandas
 genanki
 gTTS
 tenacity
+youtube-transcript-api
+requests
