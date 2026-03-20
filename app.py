@@ -28,8 +28,8 @@ if 'audio_cache'     not in st.session_state: st.session_state['audio_cache']   
 if 'last_api_call'   not in st.session_state: st.session_state['last_api_call']   = 0.0
 if 'apkg_cache'      not in st.session_state: st.session_state['apkg_cache']      = None
 if 'apkg_hash'       not in st.session_state: st.session_state['apkg_hash']       = None
-if 'undo_stack'      not in st.session_state: st.session_state['undo_stack']      = []   # D1
-if 'card_filter'     not in st.session_state: st.session_state['card_filter']     = ""   # D4
+if 'undo_stack'      not in st.session_state: st.session_state['undo_stack']      = []
+if 'card_filter'     not in st.session_state: st.session_state['card_filter']     = ""
 
 # ── Persistent RPD Tracker ────────────────────────────────────────────────────
 TRACKER_FILE = "rpd_tracker.json"
@@ -55,7 +55,6 @@ if 'rpd_used' not in st.session_state:
 
 # ── B5: MathJax CDN + Full CSS Injection ─────────────────────────────────────
 st.markdown("""
-    <!-- B5: MathJax 3 with mhchem for live inline/display/chemistry rendering in preview -->
     <script>
     MathJax = {
       tex: {
@@ -73,7 +72,6 @@ st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
 
-    /* ── Anki Night Mode Preview ── */
     .anki-preview-container {
         background-color: #272828; color: #e2e2e2;
         border-radius: 12px; padding: 20px;
@@ -90,15 +88,11 @@ st.markdown("""
                                    border-radius: 8px; border: 1px solid #444; }
     .anki-preview-meta           { font-size: 0.72em; text-align: right;
                                    opacity: 0.6; margin-bottom: 6px; }
-
-    /* ── B2: Confidence Dots ── */
     .conf-dot                    { display: inline-block; width: 10px; height: 10px;
                                    border-radius: 50%; margin-right: 5px; vertical-align: middle; }
     .conf-high                   { background: #4caf50; }
     .conf-med                    { background: #ff9800; }
     .conf-low                    { background: #f44336; }
-
-    /* ── Misc ── */
     .tag-pill                    { background: rgba(0,170,255,0.2); color: #00aaff;
                                    padding: 2px 10px; border-radius: 15px; font-size: 0.8em; }
     table                        { width: 100%; border-collapse: collapse; margin-top: 10px; }
@@ -110,41 +104,38 @@ st.markdown("""
 # CORE HELPERS & SAFEGUARDS
 # ================================================
 def enforce_api_delay():
-    """Strict Token Bucket — 13 s gap enforces ≤ 5 RPM Free Tier."""
+    """Strict Token Bucket — 13 s gap enforces <= 5 RPM Free Tier."""
     elapsed       = time.time() - st.session_state['last_api_call']
     required_wait = 13.0
     if elapsed < required_wait:
         wait_time = required_wait - elapsed
-        with st.spinner(f"⏳ API Rate Limit Safeguard: Waiting {wait_time:.1f}s…"):
+        with st.spinner(f"API Rate Limit Safeguard: Waiting {wait_time:.1f}s..."):
             time.sleep(wait_time)
     st.session_state['last_api_call'] = time.time()
 
 def check_rpd_preflight(req_needed):
-    """A2: Pre-flight RPD guard — returns (ok: bool, message: str | None)."""
     remaining = 20 - st.session_state['rpd_used']
     if req_needed > remaining:
         overage = req_needed - remaining
         return False, (
-            f"🚨 This batch needs **{req_needed}** requests but only **{remaining}** remain today "
+            f"This batch needs **{req_needed}** requests but only **{remaining}** remain today "
             f"(overage: {overage}). Reduce input size or wait until tomorrow."
         )
     if remaining > 0 and req_needed / remaining >= 0.75:
         pct = int(req_needed / remaining * 100)
         return True, (
-            f"⚠️ Warning: This will consume **{req_needed}/{remaining}** remaining requests "
+            f"Warning: This will consume **{req_needed}/{remaining}** remaining requests "
             f"({pct}% of your quota)."
         )
     return True, None
 
 def push_undo(cards):
-    """D1: Snapshot current cards onto undo stack (max depth 3)."""
     import copy
     st.session_state['undo_stack'].append(copy.deepcopy(cards))
     if len(st.session_state['undo_stack']) > 3:
         st.session_state['undo_stack'].pop(0)
 
 def smart_chunk_text(text, max_chars=50000):
-    """Semantic chunking — splits at paragraph, sentence, or word boundaries."""
     chunks = []
     while len(text) > max_chars:
         split_idx = text.rfind('\n\n', 0, max_chars)
@@ -179,7 +170,6 @@ def is_duplicate(new_q, existing_cards, threshold=0.85):
     return False
 
 def get_confidence_dot(score):
-    """B2: Returns a coloured HTML dot based on confidence tier."""
     try:
         s = int(score)
         if s >= 80: cls, label = "conf-high", "High"
@@ -190,7 +180,6 @@ def get_confidence_dot(score):
         return ''
 
 def get_confidence_tag(score):
-    """B2: Returns an Anki-safe tag string for the confidence tier."""
     try:
         s = int(score)
         if s >= 80: return "confidence_high"
@@ -202,20 +191,13 @@ def get_confidence_tag(score):
 # ================================================
 # ANKI .APKG EXPORT ENGINE
 # ================================================
-# ── FIX: Redesigned ANKI_CSS ─────────────────────────────────────────────────
-# Changes vs old version:
-#   1. Added overflow-wrap, word-break, box-sizing on .card for safe text wrapping
-#   2. Added mjx-container / .MathJax overflow-x:auto so long equations SCROLL
-#      instead of getting clipped on narrow Android screens
-#   3. Introduced .question-block and .answer-block as styled card sections
-#      with rounded corners, shadows, and accent colours
-#   4. Context block now uses a dashed top-border and subtle italic style
-#   5. Table gets display:block + overflow-x:auto so wide tables also scroll
+# ── FIX 2: answer-block now uses overflow-x:auto + box-sizing:border-box
+#    so MathJax equations scroll horizontally instead of overflowing/clipping.
+#    The max-width stays but box-sizing ensures padding doesn't fight equation width.
 # ─────────────────────────────────────────────────────────────────────────────
 ANKI_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
 
-/* ── Base Card ── */
 .card {
     font-family: 'Inter', Arial, sans-serif;
     font-size: 18px;
@@ -233,7 +215,6 @@ ANKI_CSS = """
     color: #e2e8f0;
 }
 
-/* ── Question Block ── */
 .question-block {
     background: #ffffff;
     border-radius: 18px;
@@ -246,6 +227,7 @@ ANKI_CSS = """
     line-height: 1.6;
     border-left: 5px solid #4a90e2;
     overflow-x: auto;
+    box-sizing: border-box;
 }
 .card.nightMode .question-block {
     background: #0f3460;
@@ -253,13 +235,15 @@ ANKI_CSS = """
     border-left: 5px solid #60b4ff;
 }
 
-/* ── Answer Block ── */
+/* FIX 2: answer-block scrolls wide equations instead of clipping them */
 .answer-block {
     background: #ffffff;
     border-radius: 18px;
     padding: 20px;
     margin: 0 auto 16px auto;
     max-width: 520px;
+    width: 100%;
+    box-sizing: border-box;
     box-shadow: 0 6px 24px rgba(0, 80, 200, 0.08);
     color: #0055cc;
     font-weight: 700;
@@ -267,6 +251,7 @@ ANKI_CSS = """
     line-height: 1.6;
     border-left: 5px solid #00c853;
     overflow-x: auto;
+    overflow-y: visible;
 }
 .card.nightMode .answer-block {
     background: #0a2a4a;
@@ -274,9 +259,7 @@ ANKI_CSS = """
     border-left: 5px solid #00e676;
 }
 
-/* ── CRITICAL FIX: MathJax Mobile Overflow ── */
-/* Equations that are wider than the screen now scroll horizontally  */
-/* instead of being clipped or breaking the layout.                  */
+/* CRITICAL: MathJax Mobile Overflow — equations scroll, never clip */
 mjx-container,
 .MathJax,
 .MathJax_Display {
@@ -284,10 +267,10 @@ mjx-container,
     overflow-x: auto;
     overflow-y: hidden;
     display: block !important;
-    padding-bottom: 4px;   /* room for the scrollbar on some devices */
+    padding-bottom: 4px;
+    box-sizing: border-box;
 }
 
-/* ── Context ── */
 .context {
     font-size: 14px;
     color: #6b7280;
@@ -298,13 +281,13 @@ mjx-container,
     border-top: 2px dashed #c8d0e0;
     overflow-wrap: break-word;
     line-height: 1.5;
+    box-sizing: border-box;
 }
 .card.nightMode .context {
     color: #94a3b8;
     border-top: 2px dashed #334155;
 }
 
-/* ── MCQ Options ── */
 .mcq-options {
     text-align: left;
     display: block;
@@ -316,27 +299,21 @@ mjx-container,
     background: #f8faff;
     overflow-wrap: break-word;
     line-height: 1.8;
+    box-sizing: border-box;
 }
 .card.nightMode .mcq-options {
     background: #1e293b;
     border: 2px solid #334155;
 }
-.mcq-answer {
-    color: #0055cc;
-    font-weight: bold;
-}
-.card.nightMode .mcq-answer {
-    color: #60d4ff;
-}
+.mcq-answer { color: #0055cc; font-weight: bold; }
+.card.nightMode .mcq-answer { color: #60d4ff; }
 
-/* ── Confidence Dot ── */
 .conf-dot  { display:inline-block; width:9px; height:9px; border-radius:50%;
              margin-right:5px; vertical-align:middle; }
 .conf-high { background:#4caf50; }
 .conf-med  { background:#ff9800; }
 .conf-low  { background:#f44336; }
 
-/* ── Tables: scrollable on mobile ── */
 table {
     width: 100%;
     border-collapse: collapse;
@@ -353,8 +330,6 @@ BASIC_MODEL_ID = 1607392319
 CLOZE_MODEL_ID = 1607392320
 MCQ_MODEL_ID   = 1607392321
 
-# ── FIX: Templates now wrap content in semantic blocks ────────────────────────
-# .question-block and .answer-block give the card visual structure on any screen.
 anki_basic_model = genanki.Model(
     BASIC_MODEL_ID, 'AI Anki PRO',
     fields=[
@@ -407,7 +382,7 @@ anki_mcq_model = genanki.Model(
         'afmt': (
             '<div class="question-block">{{Question}}</div>'
             '<div class="mcq-options">{{Options}}</div>'
-            '<div class="answer-block mcq-answer">✅ {{Answer}}</div>'
+            '<div class="answer-block mcq-answer">{{Answer}}</div>'
             '{{Audio}}'
             '<div class="context">{{Context}}</div>'
         )
@@ -416,9 +391,7 @@ anki_mcq_model = genanki.Model(
 )
 
 def generate_apkg(cards, deck_name, include_audio, lang_code):
-    # Deterministic Deck ID from hash of deck name
     deck_id = int(hashlib.sha256(deck_name.encode('utf-8')).hexdigest(), 16) % (10**10)
-    # B1: '::' in deck_name is natively interpreted as sub-deck hierarchy by Anki on import
     deck    = genanki.Deck(deck_id, deck_name)
     media_files = []
 
@@ -447,10 +420,8 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
                 except:
                     pass
 
-            tags = [t.strip().replace("#", "") for t in str(c.get('Tags', '')).split() if t.strip()]
+            tags     = [t.strip().replace("#", "") for t in str(c.get('Tags', '')).split() if t.strip()]
             conf_str = str(c.get('Confidence', ''))
-
-            # B2: Inject confidence tier tag into every exported note
             conf_tag = get_confidence_tag(c.get('Confidence', 0))
             if conf_tag not in tags:
                 tags.append(conf_tag)
@@ -477,9 +448,9 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
                 )
             deck.add_note(note)
 
-        package            = genanki.Package(deck)
+        package             = genanki.Package(deck)
         package.media_files = media_files
-        temp_apkg          = os.path.join(tmpdir, "export.apkg")
+        temp_apkg           = os.path.join(tmpdir, "export.apkg")
         package.write_to_file(temp_apkg)
         with open(temp_apkg, "rb") as f:
             return f.read()
@@ -487,6 +458,11 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
 # ================================================
 # SUPER-BATCH PROMPT LOGIC
 # ================================================
+# ── FIX 1: [NO IMAGE REFERENCES] rule added ───────────────────────────────────
+# Prevents the AI from generating questions like "in the image" / "as shown"
+# which become unanswerable during Anki review (no image is displayed).
+# The rule is explicit, uses STRICTLY FORBIDDEN, and lists every known phrase.
+# ─────────────────────────────────────────────────────────────────────────────
 BASE_SYSTEM_INSTRUCTION = """You are an expert Anki professor processing a massive batch of inputs.
 
 CHEMISTRY/MATH RULES: Use Native Anki MathJax for ALL math. Inline: \\( ... \\), Block: \\[ ... \\]
@@ -499,6 +475,10 @@ CARD RULES:
 - [CONTEXT]: Elaboration goes here. Format tabular data using HTML <table>, <tr>, <td> tags.
 - [HIGHLIGHT]: Wrap the single most critical keyword in the 'answer' field with <span style="color: #ffeb3b;">.
 - [DEDUPLICATION]: Do NOT generate multiple cards for the exact same concept. Ensure maximum conceptual diversity.
+- [NO IMAGE REFERENCES]: STRICTLY FORBIDDEN — never use the phrases "in the image", "in the picture",
+  "as shown", "in the diagram", "in the figure", "depicted above", "shown above", "illustrated above",
+  or ANY wording that implies a visual aid is present during review. Cards are studied without any images.
+  Every single question must be 100% self-contained and answerable from the question text alone.
 
 CRITICAL: Return a strictly valid JSON array of objects matching the schema below.
 EXAMPLE SCHEMA:
@@ -506,7 +486,6 @@ EXAMPLE SCHEMA:
 """
 
 def extract_partial_json(text_response):
-    """Fallback salvager — recovers any structurally valid card objects."""
     cards   = []
     matches = re.findall(r'\{[^{}]*\}', text_response)
     for match in matches:
@@ -518,7 +497,7 @@ def extract_partial_json(text_response):
             pass
     return cards
 
-# A1: Tenacity retry — exponential backoff (15 s → 60 s), 3 attempts max
+# A1: Tenacity retry — exponential backoff (15 s to 60 s), 3 attempts max
 @retry(
     wait=wait_exponential(multiplier=2, min=15, max=60),
     stop=stop_after_attempt(3),
@@ -526,7 +505,6 @@ def extract_partial_json(text_response):
     reraise=True
 )
 def _call_gemini(model, content):
-    """Isolated API call wrapped in tenacity retry logic."""
     return model.generate_content(content)
 
 def process_super_batch(payloads, model, prompt_suffix, is_image=True):
@@ -543,27 +521,26 @@ def process_super_batch(payloads, model, prompt_suffix, is_image=True):
     try:
         return json.loads(clean_json)
     except json.JSONDecodeError:
-        st.warning("⚠️ API output hit token limits — salvaging valid cards…")
+        st.warning("API output hit token limits - salvaging valid cards...")
         return extract_partial_json(clean_json)
 
 # ================================================
 # SIDEBAR CONFIGURATION
 # ================================================
 with st.sidebar:
-    st.title("⚙️ Configuration")
+    st.title("Configuration")
 
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
-        st.success("✅ API Key loaded from secrets")
+        st.success("API Key loaded from secrets")
     except:
         api_key = st.text_input("Gemini API Key:", type="password")
 
     subject = st.text_input("Subject (use :: for sub-decks):", value="Science::Biology")
 
-    # B1: Live hierarchy display
     if "::" in subject:
         parts = [p.strip() for p in subject.split("::") if p.strip()]
-        st.caption("📂 Deck hierarchy: " + " → ".join(parts))
+        st.caption("Deck hierarchy: " + " > ".join(parts))
 
     language = st.selectbox("Language:", ["English", "Bahasa Indonesia", "Bilingual"])
     LANG_MAP  = {"English": "en", "Bahasa Indonesia": "id", "Bilingual": "id"}
@@ -574,16 +551,14 @@ with st.sidebar:
     mcq_mode   = st.checkbox("Enable Multiple Choice (MCQ)")
 
     st.divider()
-    # C1: Confidence Quality Filter
-    st.subheader("🎯 Quality Filter")
+    st.subheader("Quality Filter")
     min_confidence = st.slider(
         "Min. Confidence Score", min_value=0, max_value=100, value=0, step=5,
         help="Cards below this threshold are hidden from preview AND excluded from export."
     )
 
     st.divider()
-    # API Quota Tracker
-    st.subheader("📊 API Quota Tracker")
+    st.subheader("API Quota Tracker")
     rpd_val = st.session_state['rpd_used']
     st.progress(min(rpd_val / 20.0, 1.0))
     remaining_rpd = max(0, 20 - rpd_val)
@@ -591,11 +566,10 @@ with st.sidebar:
 
     quota_reached = (rpd_val >= 20)
     if quota_reached:
-        st.error("🚨 Daily Limit Reached. App is in Read-Only mode.")
+        st.error("Daily Limit Reached. App is in Read-Only mode.")
 
     st.divider()
-    # D5: Session Management — Import
-    st.subheader("📂 Session Management")
+    st.subheader("Session Management")
     session_file = st.file_uploader("Load Session (.json)", type=['json'])
     if session_file:
         try:
@@ -604,14 +578,14 @@ with st.sidebar:
                 push_undo(st.session_state['generated_cards'])
                 st.session_state['generated_cards'] = loaded
                 st.session_state['apkg_cache']      = None
-                st.success(f"✅ Loaded {len(loaded)} cards from session.")
+                st.success(f"Loaded {len(loaded)} cards from session.")
                 st.rerun()
             else:
                 st.error("Invalid session file format.")
         except Exception as e:
             st.error(f"Failed to load session: {e}")
 
-    if st.button("🗑️ Reset Memory"):
+    if st.button("Reset Memory"):
         st.session_state['generated_cards'] = []
         st.session_state['audio_cache']     = {}
         st.session_state['apkg_cache']      = None
@@ -621,7 +595,7 @@ with st.sidebar:
 # ================================================
 # MODEL & PROMPT ASSEMBLY
 # ================================================
-st.title("🎓 AI Anki Generator PRO")
+st.title("AI Anki Generator PRO")
 
 instruction = BASE_SYSTEM_INSTRUCTION
 
@@ -636,7 +610,6 @@ if mcq_mode:
         "\nMULTIPLE CHOICE MODE: Provide exactly 3 realistic wrong answers in 'distractors'. "
         "Distractors must be contextually similar to the correct answer to prevent obvious guessing."
     )
-# C4: True bilingual — no longer just sets lang_code; injects explicit translation directive
 if language == "Bilingual":
     instruction += (
         "\nBILINGUAL MODE: Write 'question' in English and 'answer' entirely in Bahasa Indonesia. "
@@ -653,12 +626,11 @@ if api_key:
     )
 
 prompt_suffix = f"Subject: {subject}. Language: {language}."
-tab_img, tab_txt = st.tabs(["📸 Image Super-Batch", "📝 Text/Notes Super-Batch"])
+tab_img, tab_txt = st.tabs(["Image Super-Batch", "Text/Notes Super-Batch"])
 
-# ── Helper: card appender (shared by both tabs) ───────────────────────────────
 def append_cards_from_response(cards):
     for card in cards:
-        new_q   = card.get('question', '')
+        new_q    = card.get('question', '')
         mcq_html = ""
         if mcq_mode and card.get('distractors'):
             options = [card.get('answer')] + card.get('distractors')
@@ -687,7 +659,7 @@ with tab_img:
     )
 
     if uploaded_files:
-        with st.expander("🖼️ Preview Uploaded Images"):
+        with st.expander("Preview Uploaded Images"):
             cols = st.columns(5)
             for i, f in enumerate(uploaded_files):
                 cols[i % 5].image(f, use_column_width=True)
@@ -695,30 +667,28 @@ with tab_img:
         if api_key:
             req_needed = max(1, (len(uploaded_files) + 9) // 10)
 
-            # A2: Pre-flight RPD guard
             ok, preflight_msg = check_rpd_preflight(req_needed)
             if preflight_msg:
                 (st.warning if ok else st.error)(preflight_msg)
-            st.info(f"ℹ️ {len(uploaded_files)} image(s) → **{req_needed} API Request(s)**.")
+            st.info(f"{len(uploaded_files)} image(s) -> **{req_needed} API Request(s)**.")
 
-            if st.button("🚀 Generate from Images", type="primary",
+            if st.button("Generate from Images", type="primary",
                          disabled=(quota_reached or not ok)):
-                push_undo(st.session_state['generated_cards'])  # D1: snapshot before gen
-                with st.status(f"Processing {req_needed} super-batch request(s)…", expanded=True) as status:
+                push_undo(st.session_state['generated_cards'])
+                with st.status(f"Processing {req_needed} super-batch request(s)...", expanded=True) as status:
                     for i in range(0, len(uploaded_files), 10):
-                        chunk         = uploaded_files[i:i + 10]
+                        chunk          = uploaded_files[i:i + 10]
                         processed_imgs = [enhance_image(Image.open(f)) for f in chunk]
-                        # C2: Adaptive card count — ~5 cards per image, capped at 30
                         target_cards   = min(30, len(chunk) * 5)
                         adaptive_sfx   = prompt_suffix + f" Generate approximately {target_cards} diverse, atomic flashcards."
                         try:
                             cards = process_super_batch(processed_imgs, model, adaptive_sfx, is_image=True)
                             st.session_state['rpd_used'] = increment_rpd(1)
                             append_cards_from_response(cards)
-                            st.write(f"✅ Batch {i//10 + 1}: {len(cards)} cards generated.")
+                            st.write(f"Batch {i//10 + 1}: {len(cards)} cards generated.")
                         except Exception as e:
                             st.error(f"Batch {i//10 + 1} Error: {e}")
-                    status.update(label="✅ Image Processing Finished!", state="complete")
+                    status.update(label="Image Processing Finished!", state="complete")
                 st.rerun()
 
 # ================================================
@@ -731,28 +701,26 @@ with tab_txt:
         text_chunks = smart_chunk_text(pasted_text)
         req_needed  = len(text_chunks)
 
-        # A2: Pre-flight RPD guard
         ok, preflight_msg = check_rpd_preflight(req_needed)
         if preflight_msg:
             (st.warning if ok else st.error)(preflight_msg)
-        st.info(f"ℹ️ {len(pasted_text):,} characters → **{req_needed} chunk(s)** → **{req_needed} API Request(s)**.")
+        st.info(f"{len(pasted_text):,} characters -> **{req_needed} chunk(s)** -> **{req_needed} API Request(s)**.")
 
-        if st.button("🚀 Generate from Text", type="primary",
+        if st.button("Generate from Text", type="primary",
                      disabled=(quota_reached or not ok)):
-            push_undo(st.session_state['generated_cards'])  # D1: snapshot before gen
-            with st.status("Processing text chunks…", expanded=True) as status:
+            push_undo(st.session_state['generated_cards'])
+            with st.status("Processing text chunks...", expanded=True) as status:
                 for idx_c, chunk in enumerate(text_chunks):
-                    # C2: Adaptive card count — ~1 card per 300 chars, capped at 40
                     target_cards = min(40, max(5, len(chunk) // 300))
                     adaptive_sfx  = prompt_suffix + f" Generate approximately {target_cards} diverse, atomic flashcards."
                     try:
                         cards = process_super_batch(chunk, model, adaptive_sfx, is_image=False)
                         st.session_state['rpd_used'] = increment_rpd(1)
                         append_cards_from_response(cards)
-                        st.write(f"✅ Chunk {idx_c + 1}/{req_needed}: {len(cards)} cards generated.")
+                        st.write(f"Chunk {idx_c + 1}/{req_needed}: {len(cards)} cards generated.")
                     except Exception as e:
                         st.error(f"Chunk {idx_c + 1} Error: {e}")
-                status.update(label="✅ Text Processing Finished!", state="complete")
+                status.update(label="Text Processing Finished!", state="complete")
             st.rerun()
 
 # ================================================
@@ -763,38 +731,34 @@ if st.session_state['generated_cards']:
 
     all_cards = st.session_state['generated_cards']
 
-    # ── D1: Undo button ───────────────────────────────────────────────────────
     undo_col, _ = st.columns([1, 5])
     with undo_col:
         if st.session_state['undo_stack']:
-            if st.button("↩️ Undo Last Batch"):
+            if st.button("Undo Last Batch"):
                 st.session_state['generated_cards'] = st.session_state['undo_stack'].pop()
                 st.session_state['apkg_cache']      = None
                 st.rerun()
 
-    # ── D2: Statistics Dashboard ──────────────────────────────────────────────
-    total      = len(all_cards)
-    mcq_count  = sum(1 for c in all_cards if c.get('Options'))
+    total       = len(all_cards)
+    mcq_count   = sum(1 for c in all_cards if c.get('Options'))
     cloze_count = sum(1 for c in all_cards if "{{c" in str(c.get('Question', '')))
-    avg_conf   = int(sum(int(c.get('Confidence', 0) or 0) for c in all_cards) / max(total, 1))
-    all_tags   = {t.strip() for c in all_cards for t in str(c.get('Tags', '')).split() if t.strip()}
+    avg_conf    = int(sum(int(c.get('Confidence', 0) or 0) for c in all_cards) / max(total, 1))
+    all_tags    = {t.strip() for c in all_cards for t in str(c.get('Tags', '')).split() if t.strip()}
 
-    # C1: Confidence filter — build indexed list to preserve real indices safely
-    indexed_all     = list(enumerate(all_cards))
+    indexed_all      = list(enumerate(all_cards))
     filtered_indexed = [(i, c) for i, c in indexed_all
                         if int(c.get('Confidence', 0) or 0) >= min_confidence]
 
-    st.markdown("#### 📊 Deck Statistics")
+    st.markdown("#### Deck Statistics")
     s1, s2, s3, s4, s5 = st.columns(5)
-    s1.metric("Total Cards",    total)
-    s2.metric("After Filter",   len(filtered_indexed))
-    s3.metric("MCQ / Cloze",    f"{mcq_count} / {cloze_count}")
-    s4.metric("Avg. Confidence",f"{avg_conf}%")
-    s5.metric("Unique Tags",    len(all_tags))
+    s1.metric("Total Cards",     total)
+    s2.metric("After Filter",    len(filtered_indexed))
+    s3.metric("MCQ / Cloze",     f"{mcq_count} / {cloze_count}")
+    s4.metric("Avg. Confidence", f"{avg_conf}%")
+    s5.metric("Unique Tags",     len(all_tags))
 
-    # ── D4: Keyword Search / Filter ───────────────────────────────────────────
     filter_query = st.text_input(
-        "🔍 Filter cards by keyword (searches question, answer, and tags):",
+        "Filter cards by keyword (searches question, answer, and tags):",
         value=st.session_state['card_filter']
     )
     st.session_state['card_filter'] = filter_query
@@ -810,27 +774,24 @@ if st.session_state['generated_cards']:
 
     filtered_cards = [c for _, c in filtered_indexed]
 
-    # ── Data Editor ───────────────────────────────────────────────────────────
-    df         = pd.DataFrame(all_cards)
-    edited_df  = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+    df        = pd.DataFrame(all_cards)
+    edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
     st.session_state['generated_cards'] = edited_df.fillna("").to_dict('records')
 
-    # ── Bulk Tag Manager ──────────────────────────────────────────────────────
-    with st.expander("🏷️ Bulk Tag Manager"):
+    with st.expander("Bulk Tag Manager"):
         b_col1, b_col2, b_col3 = st.columns(3)
         bulk_tag = b_col1.text_input("Tag (e.g., #Exam1):").replace(" ", "_")
-        if b_col2.button("➕ Add to All") and bulk_tag:
+        if b_col2.button("Add to All") and bulk_tag:
             for c in st.session_state['generated_cards']:
                 if bulk_tag not in c['Tags']:
                     c['Tags'] += f" {bulk_tag}"
             st.rerun()
-        if b_col3.button("➖ Remove from All") and bulk_tag:
+        if b_col3.button("Remove from All") and bulk_tag:
             for c in st.session_state['generated_cards']:
                 c['Tags'] = c['Tags'].replace(bulk_tag, "").strip()
             st.rerun()
 
-    # ── Night Mode Card Preview (B5: MathJax renders via CDN loaded above) ────
-    st.subheader("👀 Night Mode Card Preview")
+    st.subheader("Night Mode Card Preview")
     total_visible = len(filtered_cards)
     if total_visible == 0:
         st.info("No cards match current filter / confidence threshold.")
@@ -844,7 +805,6 @@ if st.session_state['generated_cards']:
                 f"<div class='anki-preview-mcq'>{c.get('Options', '')}</div>"
                 if c.get('Options') else ""
             )
-            # B2: Confidence dot shown in card header; B5: MathJax auto-processes \( \)
             st.markdown(f"""
                 <div class="anki-preview-container">
                     <div class="anki-preview-meta">
@@ -860,14 +820,14 @@ if st.session_state['generated_cards']:
 
             p_col1, p_col2 = st.columns([1, 4])
             with p_col1:
-                if st.button("🔊 Listen", key=f"tts_{real_idx}_{slot}"):
+                if st.button("Listen", key=f"tts_{real_idx}_{slot}"):
                     clean_ans = re.sub(r'<[^>]+>|\\\[|\\\]|\\\(|\\\)', '', str(c['Answer']))
                     tts_obj   = gTTS(clean_ans, lang=current_lang_code)
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
                         tts_obj.save(fp.name)
                         st.audio(fp.name)
             with p_col2:
-                if st.button("🗑️ Delete Card", key=f"del_{real_idx}_{slot}"):
+                if st.button("Delete Card", key=f"del_{real_idx}_{slot}"):
                     st.session_state['generated_cards'].pop(real_idx)
                     st.session_state['apkg_cache'] = None
                     st.rerun()
@@ -879,27 +839,26 @@ if st.session_state['generated_cards']:
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.subheader("📦 Finalize Deck")
+        st.subheader("Finalize Deck")
         include_audio = st.toggle("Include Answer TTS in Export", value=True)
 
-        # C1: Export uses filtered cards only when a filter is active
         export_cards = filtered_cards if (filter_query or min_confidence > 0) else all_cards
         if min_confidence > 0 or filter_query:
-            st.caption(f"ℹ️ Exporting **{len(export_cards)}** filtered card(s) of {total} total.")
+            st.caption(f"Exporting **{len(export_cards)}** filtered card(s) of {total} total.")
 
         current_data_hash = hash(str(export_cards) + str(include_audio) + subject)
 
         if st.session_state['apkg_hash'] != current_data_hash or st.session_state['apkg_cache'] is None:
-            if st.button("⚡ Compile Anki Deck"):
-                with st.spinner("Compiling media and packaging deck…"):
+            if st.button("Compile Anki Deck"):
+                with st.spinner("Compiling media and packaging deck..."):
                     apkg = generate_apkg(export_cards, subject, include_audio, current_lang_code)
                     st.session_state['apkg_cache'] = apkg
                     st.session_state['apkg_hash']  = current_data_hash
                     st.rerun()
         else:
-            st.success("✅ Compilation complete!")
+            st.success("Compilation complete!")
             st.download_button(
-                "💾 Download .apkg",
+                "Download .apkg",
                 st.session_state['apkg_cache'],
                 file_name=f"{subject.replace('::', '_')}.apkg",
                 mime="application/octet-stream",
@@ -907,10 +866,10 @@ if st.session_state['generated_cards']:
             )
 
     with col2:
-        st.subheader("📄 CSV Backup")
+        st.subheader("CSV Backup")
         csv_data = df.to_csv(index=False)
         st.download_button(
-            "📥 Download CSV",
+            "Download CSV",
             csv_data,
             file_name=f"{subject.replace('::', '_')}.csv",
             mime="text/csv",
@@ -918,11 +877,10 @@ if st.session_state['generated_cards']:
         )
 
     with col3:
-        # D5: Session JSON export — full fidelity, re-importable via sidebar uploader
-        st.subheader("💾 Save Session")
+        st.subheader("Save Session")
         session_json = json.dumps(st.session_state['generated_cards'], indent=2, ensure_ascii=False)
         st.download_button(
-            "📤 Export Session (.json)",
+            "Export Session (.json)",
             session_json,
             file_name=f"{subject.replace('::', '_')}_session.json",
             mime="application/json",
