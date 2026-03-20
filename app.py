@@ -202,24 +202,149 @@ def get_confidence_tag(score):
 # ================================================
 # ANKI .APKG EXPORT ENGINE
 # ================================================
+# ── FIX: Redesigned ANKI_CSS ─────────────────────────────────────────────────
+# Changes vs old version:
+#   1. Added overflow-wrap, word-break, box-sizing on .card for safe text wrapping
+#   2. Added mjx-container / .MathJax overflow-x:auto so long equations SCROLL
+#      instead of getting clipped on narrow Android screens
+#   3. Introduced .question-block and .answer-block as styled card sections
+#      with rounded corners, shadows, and accent colours
+#   4. Context block now uses a dashed top-border and subtle italic style
+#   5. Table gets display:block + overflow-x:auto so wide tables also scroll
+# ─────────────────────────────────────────────────────────────────────────────
 ANKI_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
-.card { font-family: 'Inter', Arial, sans-serif; font-size: 20px; text-align: center;
-        color: black; background-color: white; }
-.card.nightMode { background-color: #272828; color: #e2e2e2; }
-.context { font-size: 16px; color: #777; margin-top: 20px; font-style: italic;
-           border-top: 1px solid #ccc; padding-top: 10px; }
-.card.nightMode .context { color: #aaa; border-top: 1px solid #555; }
-.mcq-options { text-align: left; display: inline-block; margin: 15px auto; padding: 15px;
-               border: 1px solid #ccc; border-radius: 8px; background-color: #fafafa; }
-.card.nightMode .mcq-options { background-color: #333; border: 1px solid #555; }
-.mcq-answer { color: #00aaff; font-weight: bold; }
-/* B2: confidence dot in exported card */
-.conf-dot { display:inline-block; width:9px; height:9px; border-radius:50%;
-            margin-right:5px; vertical-align:middle; }
-.conf-high { background:#4caf50; } .conf-med { background:#ff9800; } .conf-low { background:#f44336; }
-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
+/* ── Base Card ── */
+.card {
+    font-family: 'Inter', Arial, sans-serif;
+    font-size: 18px;
+    text-align: center;
+    color: #1a1a2e;
+    background: linear-gradient(160deg, #f0f4ff 0%, #e8edf8 100%);
+    min-height: 100vh;
+    padding: 24px 16px;
+    box-sizing: border-box;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+.card.nightMode {
+    background: linear-gradient(160deg, #1a1a2e 0%, #16213e 100%);
+    color: #e2e8f0;
+}
+
+/* ── Question Block ── */
+.question-block {
+    background: #ffffff;
+    border-radius: 18px;
+    padding: 24px 20px;
+    margin: 0 auto 20px auto;
+    max-width: 520px;
+    box-shadow: 0 6px 24px rgba(0, 80, 200, 0.10);
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1.6;
+    border-left: 5px solid #4a90e2;
+    overflow-x: auto;
+}
+.card.nightMode .question-block {
+    background: #0f3460;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+    border-left: 5px solid #60b4ff;
+}
+
+/* ── Answer Block ── */
+.answer-block {
+    background: #ffffff;
+    border-radius: 18px;
+    padding: 20px;
+    margin: 0 auto 16px auto;
+    max-width: 520px;
+    box-shadow: 0 6px 24px rgba(0, 80, 200, 0.08);
+    color: #0055cc;
+    font-weight: 700;
+    font-size: 19px;
+    line-height: 1.6;
+    border-left: 5px solid #00c853;
+    overflow-x: auto;
+}
+.card.nightMode .answer-block {
+    background: #0a2a4a;
+    color: #60d4ff;
+    border-left: 5px solid #00e676;
+}
+
+/* ── CRITICAL FIX: MathJax Mobile Overflow ── */
+/* Equations that are wider than the screen now scroll horizontally  */
+/* instead of being clipped or breaking the layout.                  */
+mjx-container,
+.MathJax,
+.MathJax_Display {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    display: block !important;
+    padding-bottom: 4px;   /* room for the scrollbar on some devices */
+}
+
+/* ── Context ── */
+.context {
+    font-size: 14px;
+    color: #6b7280;
+    margin: 12px auto 0 auto;
+    max-width: 520px;
+    font-style: italic;
+    padding: 12px 16px;
+    border-top: 2px dashed #c8d0e0;
+    overflow-wrap: break-word;
+    line-height: 1.5;
+}
+.card.nightMode .context {
+    color: #94a3b8;
+    border-top: 2px dashed #334155;
+}
+
+/* ── MCQ Options ── */
+.mcq-options {
+    text-align: left;
+    display: block;
+    margin: 16px auto;
+    max-width: 520px;
+    padding: 16px 20px;
+    border: 2px solid #dce3f0;
+    border-radius: 14px;
+    background: #f8faff;
+    overflow-wrap: break-word;
+    line-height: 1.8;
+}
+.card.nightMode .mcq-options {
+    background: #1e293b;
+    border: 2px solid #334155;
+}
+.mcq-answer {
+    color: #0055cc;
+    font-weight: bold;
+}
+.card.nightMode .mcq-answer {
+    color: #60d4ff;
+}
+
+/* ── Confidence Dot ── */
+.conf-dot  { display:inline-block; width:9px; height:9px; border-radius:50%;
+             margin-right:5px; vertical-align:middle; }
+.conf-high { background:#4caf50; }
+.conf-med  { background:#ff9800; }
+.conf-low  { background:#f44336; }
+
+/* ── Tables: scrollable on mobile ── */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    display: block;
+    overflow-x: auto;
+}
+th, td { border: 1px solid #ccc; padding: 8px; text-align: left; min-width: 80px; }
 .card.nightMode th, .card.nightMode td { border: 1px solid #555; }
 """
 
@@ -228,7 +353,8 @@ BASIC_MODEL_ID = 1607392319
 CLOZE_MODEL_ID = 1607392320
 MCQ_MODEL_ID   = 1607392321
 
-# B2: 'Confidence' field added to all three models for tag + visual use
+# ── FIX: Templates now wrap content in semantic blocks ────────────────────────
+# .question-block and .answer-block give the card visual structure on any screen.
 anki_basic_model = genanki.Model(
     BASIC_MODEL_ID, 'AI Anki PRO',
     fields=[
@@ -237,9 +363,13 @@ anki_basic_model = genanki.Model(
     ],
     templates=[{
         'name': 'Card 1',
-        'qfmt': '{{Question}}',
-        'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}<br><br>{{Audio}}'
-                '<div class="context">{{Context}}</div>'
+        'qfmt': '<div class="question-block">{{Question}}</div>',
+        'afmt': (
+            '<div class="question-block">{{Question}}</div>'
+            '<div class="answer-block">{{Answer}}</div>'
+            '{{Audio}}'
+            '<div class="context">{{Context}}</div>'
+        )
     }],
     css=ANKI_CSS
 )
@@ -252,8 +382,12 @@ anki_cloze_model = genanki.Model(
     ],
     templates=[{
         'name': 'Cloze',
-        'qfmt': '{{cloze:Text}}',
-        'afmt': '{{cloze:Text}}<br><br>{{Audio}}<div class="context">{{Context}}</div>'
+        'qfmt': '<div class="question-block">{{cloze:Text}}</div>',
+        'afmt': (
+            '<div class="question-block">{{cloze:Text}}</div>'
+            '{{Audio}}'
+            '<div class="context">{{Context}}</div>'
+        )
     }],
     css=ANKI_CSS
 )
@@ -266,10 +400,17 @@ anki_mcq_model = genanki.Model(
     ],
     templates=[{
         'name': 'MCQ Card',
-        'qfmt': '{{Question}}<br><br><div class="mcq-options">{{Options}}</div>',
-        'afmt': '{{Question}}<br><br><div class="mcq-options">{{Options}}</div>'
-                '<hr id="answer"><span class="mcq-answer">{{Answer}}</span>'
-                '<br><br>{{Audio}}<div class="context">{{Context}}</div>'
+        'qfmt': (
+            '<div class="question-block">{{Question}}</div>'
+            '<div class="mcq-options">{{Options}}</div>'
+        ),
+        'afmt': (
+            '<div class="question-block">{{Question}}</div>'
+            '<div class="mcq-options">{{Options}}</div>'
+            '<div class="answer-block mcq-answer">✅ {{Answer}}</div>'
+            '{{Audio}}'
+            '<div class="context">{{Context}}</div>'
+        )
     }],
     css=ANKI_CSS
 )
@@ -301,7 +442,7 @@ def generate_apkg(cards, deck_name, include_audio, lang_code):
                             tts.save(filepath)
                             with open(filepath, 'rb') as f:
                                 st.session_state['audio_cache'][cache_key] = f.read()
-                        media_files.append(filepath)  # No orphaned media bloat
+                        media_files.append(filepath)
                         audio_field = f"[sound:{filename}]"
                 except:
                     pass
